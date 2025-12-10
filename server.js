@@ -14,9 +14,9 @@ if (!admin.apps.length) {
     credential: admin.credential.cert({
       projectId: process.env.FIREBASE_PROJECT_ID,
       clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-      privateKey: process.env.FIREBASE_PRIVATE_KEY
-        ? process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, "\n")
-        : undefined,
+      // 🔥 IMPORTANTE: aquí usamos la clave TAL CUAL viene de la variable de entorno,
+      // en formato PEM con saltos de línea reales.
+      privateKey: process.env.FIREBASE_PRIVATE_KEY,
     }),
   });
 }
@@ -251,7 +251,7 @@ async function isSlotFeasible(slot, newLocation, block, existingAppointmentsForB
  */
 async function getServiceByToken(token) {
   const COLLECTION_NAME = "services"; // cámbialo si tu colección se llama distinto
-  const TOKEN_FIELD = "token";        // cámbialo si el campo se llama, por ejemplo, "publicToken"
+  const TOKEN_FIELD = "token";        // cámbialo si el campo se llama p.ej. "publicToken"
 
   console.log("Buscando servicio en Firestore para token:", token);
 
@@ -269,7 +269,7 @@ async function getServiceByToken(token) {
   const doc = snap.docs[0];
   const data = doc.data();
 
-  console.log("Servicio encontrado:", doc.id);
+  console.log("Servicio encontrado en Firestore, id:", doc.id);
 
   return {
     token,
