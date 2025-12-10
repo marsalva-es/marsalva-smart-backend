@@ -2,9 +2,26 @@
 const express = require("express");
 const cors = require("cors");
 
-// node-fetch en modo CommonJS
+// node-fetch en modo CommonJS (para Node 18+)
 const fetch = (...args) =>
   import("node-fetch").then(({ default: fetch }) => fetch(...args));
+
+// Firebase Admin
+const admin = require("firebase-admin");
+
+if (!admin.apps.length) {
+  admin.initializeApp({
+    credential: admin.credential.cert({
+      projectId: process.env.FIREBASE_PROJECT_ID,
+      clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+      privateKey: process.env.FIREBASE_PRIVATE_KEY
+        ? process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, "\n")
+        : undefined,
+    }),
+  });
+}
+
+const db = admin.firestore();
 
 // =============== CONFIGURACIÓN BÁSICA ===============
 
@@ -25,7 +42,7 @@ const SLOT_MINUTES = 60;
 const SERVICE_MINUTES_DEFAULT = 60;
 const TRAVEL_MARGIN_MINUTES = 10;
 
-// Clave de Google (en Render → Environment → variable GOOGLE_MAPS_API_KEY)
+// Clave de Google (en Render → Environment → GOOGLE_MAPS_API_KEY)
 const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY || "";
 
 // Puerto
@@ -65,7 +82,7 @@ function addMinutes(date, minutes) {
 
 /**
  * Devuelve un array con los próximos 'rangeDays' días naturales
- * (luego filtramos fines de semana en /availability-smart).
+ * (luego filtramos sábados y domingos en /availability-smart).
  */
 function getNextDays(rangeDays) {
   const days = [];
@@ -218,7 +235,10 @@ async function isSlotFeasible(slot, newLocation, block, existingAppointmentsForB
   return true;
 }
 
-// =============== "BASE DE DATOS" SIMULADA ===============
+// =============== "BASE DE DATOS" SIMULADA (PARTE) ===============
+//
+// Estas dos funciones siguen de prueba. Más adelante las conectamos
+// a tus colecciones reales.
 
 async function getServiceByToken(token) {
   // TODO: buscar en tu BD usando el token
@@ -238,16 +258,30 @@ async function getAppointmentsForDayBlock(dayDate, block) {
   return [];
 }
 
+// =============== AQUÍ SÍ USAMOS FIRESTORE ===============
+
 async function createAppointmentRequest(payload) {
-  // TODO: guardar en tu BD (colección de "solicitudes online")
-  console.log("Creando solicitud de cita pendiente:", payload);
+  // Guardamos la solicitud en Firestore, colección "onlineAppointmentRequests"
+  const now = new Date();
+
+  const docToSave = {
+    ...payload,
+    createdAt: now.toISOString(),
+    createdAtTimestamp: admin.firestore.Timestamp.fromDate(now),
+  };
+
+  const docRef = await db.collection("onlineAppointmentRequests").add(docToSave);
+
+  console.log("Solicitud de cita guardada en Firestore con id:", docRef.id);
+
   return {
-    requestId: "REQ-" + Date.now(),
+    requestId: docRef.id,
   };
 }
 
 // =============== ENDPOINTS ===============
 
+// 1) Datos del cliente a partir del token
 app.post("/client-from-token", async (req, res) => {
   try {
     const { token } = req.body;
@@ -274,6 +308,7 @@ app.post("/client-from-token", async (req, res) => {
   }
 });
 
+// 2) Disponibilidad inteligente (sin fines de semana)
 app.post("/availability-smart", async (req, res) => {
   try {
     const { token, block, rangeDays } = req.body;
@@ -301,7 +336,7 @@ app.post("/availability-smart", async (req, res) => {
 
     for (const day of allDays) {
       const dayOfWeek = day.getDay(); // 0 = domingo, 6 = sábado
-      // 🚫 Saltamos sábados y domingos SÍ O SÍ
+      // Saltamos sábado y domingo
       if (dayOfWeek === 0 || dayOfWeek === 6) {
         continue;
       }
@@ -343,6 +378,7 @@ app.post("/availability-smart", async (req, res) => {
   }
 });
 
+// 3) Crear solicitud de cita pendiente
 app.post("/appointment-request", async (req, res) => {
   try {
     const { token, block, date, startTime, endTime } = req.body;
@@ -369,7 +405,6 @@ app.post("/appointment-request", async (req, res) => {
       city: service.city,
       zip: service.zip,
       status: "pending",
-      createdAt: new Date().toISOString(),
     };
 
     const result = await createAppointmentRequest(payload);
