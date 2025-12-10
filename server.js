@@ -69,6 +69,9 @@ app.use(express.json());
 
 console.log("   Google API Key presente:", !!GOOGLE_MAPS_API_KEY);
 
+// Cache sencilla en memoria para geocoding
+const geocodeCache = new Map();
+
 // =============== UTILIDADES GENERALES ===============
 
 // Devuelve la fecha con hora 00:00
@@ -114,6 +117,14 @@ function getNextDays(rangeDays) {
 // =============== GOOGLE MAPS: GEOCODING + DISTANCIA ===============
 
 async function geocodeAddress(fullAddress) {
+  if (!fullAddress) {
+    throw new Error("Dirección vacía en geocodeAddress");
+  }
+
+  if (geocodeCache.has(fullAddress)) {
+    return geocodeCache.get(fullAddress);
+  }
+
   if (!GOOGLE_MAPS_API_KEY) {
     throw new Error("No hay GOOGLE_MAPS_API_KEY configurada");
   }
@@ -133,7 +144,9 @@ async function geocodeAddress(fullAddress) {
     throw new Error("No se pudo geolocalizar la dirección");
   }
   const loc = data.results[0].geometry.location;
-  return { lat: loc.lat, lng: loc.lng };
+  const result = { lat: loc.lat, lng: loc.lng };
+  geocodeCache.set(fullAddress, result);
+  return result;
 }
 
 async function getTravelTimeMinutes(origin, destination) {
@@ -208,24 +221,88 @@ function generateSlotsForDayAndBlock(dayDate, block) {
   return slots;
 }
 
-// =============== LÓGICA DE RUTA: VERSIÓN SIMPLE (SIN SOLAPES) ===============
+// =============== LÓGICA DE RUTA: EVITAR SOLAPES Y DEMASIADOS VIAJES ===============
 
-// Solo bloquea huecos que se solapan con citas existentes
 async function isSlotFeasible(
   slot,
   newLocation,
   block,
   existingAppointmentsForBlock
 ) {
-  for (const appt of existingAppointmentsForBlock) {
-    const overlap =
-      slot.start < appt.end && // empieza antes de que termine la otra
-      slot.end > appt.start;   // y termina después de que empiece la otra
+  const day = getDateOnly(slot.start);
+  const blockStartHour = block === "morning" ? MORNING_START : AFTERNOON_START;
+  const blockEndHour = block === "morning" ? MORNING_END : AFTERNOON_END;
+  const blockStartDate = buildDateWithHour(day, blockStartHour);
+  const blockEndDate = buildDateWithHour(day, blockEndHour);
 
-    if (overlap) {
+  // Cita nueva (la que está probando el cliente)
+  const newAppointment = {
+    id: "NEW",
+    start: new Date(slot.start),
+    durationMinutes: SERVICE_MINUTES_DEFAULT,
+    location: newLocation,
+    block,
+    status: "pending",
+  };
+  newAppointment.end = addMinutes(
+    newAppointment.start,
+    newAppointment.durationMinutes
+  );
+
+  // Todas las citas del bloque + la nueva
+  const allAppointments = [...existingAppointmentsForBlock, newAppointment];
+  allAppointments.sort((a, b) => a.start.getTime() - b.start.getTime());
+
+  let currentTime = new Date(blockStartDate);
+  let currentLocation = HOME_ALGECIRAS;
+
+  for (const appt of allAppointments) {
+    const duration = appt.durationMinutes || SERVICE_MINUTES_DEFAULT;
+
+    // Tiempo de viaje desde la posición actual hasta la cita
+    const travelMinutes = await getTravelTimeMinutes(
+      currentLocation,
+      appt.location || HOME_ALGECIRAS
+    );
+    const arrival = addMinutes(
+      currentTime,
+      travelMinutes + TRAVEL_MARGIN_MINUTES
+    );
+
+    const apptEndByDuration = addMinutes(appt.start, duration);
+
+    // Si llegaríamos después de que termine el intervalo de esa cita → no es viable
+    if (arrival > apptEndByDuration) {
+      return false;
+    }
+
+    // Empezamos cuando lleguemos o a la hora de la cita, lo que sea más tarde
+    const serviceStart = arrival > appt.start ? arrival : appt.start;
+    const serviceEnd = addMinutes(serviceStart, duration);
+
+    currentTime = serviceEnd;
+    currentLocation = appt.location || HOME_ALGECIRAS;
+
+    // Si nos salimos del bloque (mañana/tarde) → no es viable
+    if (currentTime > blockEndDate) {
       return false;
     }
   }
+
+  // Volver a casa al final del bloque
+  const travelBackMinutes = await getTravelTimeMinutes(
+    currentLocation,
+    HOME_ALGECIRAS
+  );
+  const arrivalHome = addMinutes(
+    currentTime,
+    travelBackMinutes + TRAVEL_MARGIN_MINUTES
+  );
+
+  if (arrivalHome > blockEndDate) {
+    return false;
+  }
+
   return true;
 }
 
@@ -260,7 +337,7 @@ async function getServiceByToken(token) {
     // Datos del cliente
     name: data.clientName || data.name || "",
     phone: data.phone || data.phoneNumber || "",
-    // Dirección
+    // Dirección (en tu app siempre está)
     address: data.address || "",
     city: data.city || "",
     zip: data.zip || data.postalCode || "",
@@ -287,9 +364,9 @@ async function getAppointmentsForDayBlock(dayDate, block) {
 
   const appointments = [];
 
-  snap.forEach((doc) => {
+  for (const doc of snap.docs) {
     const data = doc.data();
-    if (!data.date) return;
+    if (!data.date) continue;
 
     // Firestore Timestamp → Date
     let start;
@@ -297,12 +374,12 @@ async function getAppointmentsForDayBlock(dayDate, block) {
       start = data.date.toDate();
     } else {
       start = new Date(data.date);
-      if (isNaN(start.getTime())) return;
+      if (isNaN(start.getTime())) continue;
     }
 
     const hour = start.getHours();
     // Solo citas en el bloque (mañana/tarde)
-    if (hour < blockStartHour || hour >= blockEndHour) return;
+    if (hour < blockStartHour || hour >= blockEndHour) continue;
 
     // Duración de la cita:
     // - si hay duration numérico lo usamos
@@ -315,18 +392,29 @@ async function getAppointmentsForDayBlock(dayDate, block) {
 
     const end = addMinutes(start, duration);
 
-    // Aquí podrías filtrar anuladas si tienes un campo de estado:
-    // if (data.status === "cancelled" || data.status === "anulado") return;
+    // Geolocalizamos la dirección real del servicio
+    let location = HOME_ALGECIRAS;
+    try {
+      if (data.address) {
+        location = await geocodeAddress(data.address);
+      }
+    } catch (e) {
+      console.warn(
+        "No se pudo geocodificar dirección de cita, usando HOME_ALGECIRAS:",
+        e.message
+      );
+    }
 
     appointments.push({
       id: doc.id,
       start,
       end,
-      location: HOME_ALGECIRAS,
+      durationMinutes: duration,
+      location,
       block,
       status: data.status || "unknown",
     });
-  });
+  }
 
   console.log(
     `Encontradas ${appointments.length} citas existentes para ${dayStart
@@ -393,7 +481,7 @@ app.post("/client-from-token", async (req, res) => {
   }
 });
 
-// 2) Disponibilidad inteligente (sin fines de semana)
+// 2) Disponibilidad inteligente (sin fines de semana, sin horas pasadas hoy)
 app.post("/availability-smart", async (req, res) => {
   try {
     const { token, block, rangeDays } = req.body;
@@ -415,13 +503,15 @@ app.post("/availability-smart", async (req, res) => {
 
     const fullAddress =
       service.address +
-      ", " +
-      (service.zip ? service.zip + ", " : "") +
-      service.city;
+      (service.city ? ", " + service.city : "") +
+      (service.zip ? ", " + service.zip : "");
 
     const clientLocation = await geocodeAddress(fullAddress);
+
     const allDays = getNextDays(range);
     const resultDays = [];
+    const now = new Date();
+    const todayDateOnly = getDateOnly(now);
 
     for (const day of allDays) {
       const dayOfWeek = day.getDay(); // 0 = domingo, 6 = sábado
@@ -429,6 +519,8 @@ app.post("/availability-smart", async (req, res) => {
       if (dayOfWeek === 0 || dayOfWeek === 6) {
         continue;
       }
+
+      const isToday = getDateOnly(day).getTime() === todayDateOnly.getTime();
 
       const existingAppointments = await getAppointmentsForDayBlock(
         day,
@@ -438,6 +530,11 @@ app.post("/availability-smart", async (req, res) => {
       const validSlots = [];
 
       for (const slot of slots) {
+        // No ofrecer horas que ya han pasado hoy
+        if (isToday && slot.start <= now) {
+          continue;
+        }
+
         const feasible = await isSlotFeasible(
           slot,
           clientLocation,
