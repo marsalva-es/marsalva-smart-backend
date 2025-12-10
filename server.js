@@ -21,14 +21,16 @@ if (!admin.apps.length) {
   console.log("   Tiene privateKey:", !!rawPrivateKey);
 
   if (!projectId || !clientEmail || !rawPrivateKey) {
-    throw new Error("Faltan variables de entorno de Firebase (PROJECT_ID / CLIENT_EMAIL / PRIVATE_KEY)");
+    throw new Error(
+      "Faltan variables de entorno de Firebase (PROJECT_ID / CLIENT_EMAIL / PRIVATE_KEY)"
+    );
   }
 
   admin.initializeApp({
     credential: admin.credential.cert({
       projectId,
       clientEmail,
-      // 🔥 AQUÍ es donde convertimos los '\n' de texto en saltos de línea reales
+      // rawPrivateKey viene con '\n' en texto desde Render → los convertimos a saltos reales
       privateKey: rawPrivateKey.replace(/\\n/g, "\n"),
     }),
   });
@@ -45,10 +47,10 @@ const HOME_ALGECIRAS = {
 };
 
 // Horarios
-const MORNING_START = 9;    // 09:00
-const MORNING_END = 14;     // 14:00
+const MORNING_START = 9; // 09:00
+const MORNING_END = 14; // 14:00
 const AFTERNOON_START = 16; // 16:00
-const AFTERNOON_END = 20;   // 20:00;
+const AFTERNOON_END = 20; // 20:00;
 
 // Duraciones (minutos)
 const SLOT_MINUTES = 60;
@@ -200,7 +202,12 @@ function generateSlotsForDayAndBlock(dayDate, block) {
 
 // =============== LÓGICA DE RUTA ===============
 
-async function isSlotFeasible(slot, newLocation, block, existingAppointmentsForBlock) {
+async function isSlotFeasible(
+  slot,
+  newLocation,
+  block,
+  existingAppointmentsForBlock
+) {
   const day = getDateOnly(slot.start);
   const blockStartHour = block === "morning" ? MORNING_START : AFTERNOON_START;
   const blockEndHour = block === "morning" ? MORNING_END : AFTERNOON_END;
@@ -222,7 +229,10 @@ async function isSlotFeasible(slot, newLocation, block, existingAppointmentsForB
   const blockEndDate = buildDateWithHour(day, blockEndHour);
 
   for (const appt of allAppointments) {
-    const travelMinutes = await getTravelTimeMinutes(currentLocation, appt.location);
+    const travelMinutes = await getTravelTimeMinutes(
+      currentLocation,
+      appt.location
+    );
     const arrival = addMinutes(currentTime, travelMinutes + TRAVEL_MARGIN_MINUTES);
 
     if (arrival > appt.end) {
@@ -240,8 +250,14 @@ async function isSlotFeasible(slot, newLocation, block, existingAppointmentsForB
     }
   }
 
-  const travelBackMinutes = await getTravelTimeMinutes(currentLocation, HOME_ALGECIRAS);
-  const arrivalHome = addMinutes(currentTime, travelBackMinutes + TRAVEL_MARGIN_MINUTES);
+  const travelBackMinutes = await getTravelTimeMinutes(
+    currentLocation,
+    HOME_ALGECIRAS
+  );
+  const arrivalHome = addMinutes(
+    currentTime,
+    travelBackMinutes + TRAVEL_MARGIN_MINUTES
+  );
 
   if (arrivalHome > blockEndDate) {
     return false;
@@ -252,33 +268,41 @@ async function isSlotFeasible(slot, newLocation, block, existingAppointmentsForB
 
 // =============== FIRESTORE: OBTENER SERVICIO POR TOKEN ===============
 
+/**
+ * Aquí asumimos que el "token" que llega en la URL
+ * es el ID del documento en la colección "appointments".
+ *
+ * Ejemplo:
+ *  appointments / 93C4456D-4822-471F-AA37-8864DFC89F4B
+ */
 async function getServiceByToken(token) {
-  const COLLECTION_NAME = "services"; // cámbialo si tu colección se llama distinto
-  const TOKEN_FIELD = "token";        // cámbialo si el campo se llama p.ej. "publicToken"
+  console.log(
+    "Buscando cita en Firestore (appointments) para token:",
+    token
+  );
 
-  console.log("Buscando servicio en Firestore para token:", token);
+  const docRef = db.collection("appointments").doc(token);
+  const docSnap = await docRef.get();
 
-  const snap = await db
-    .collection(COLLECTION_NAME)
-    .where(TOKEN_FIELD, "==", token)
-    .limit(1)
-    .get();
-
-  if (snap.empty) {
-    console.warn("No se ha encontrado servicio para token:", token);
+  if (!docSnap.exists) {
+    console.warn(
+      "No se ha encontrado cita (appointments) para token:",
+      token
+    );
     return null;
   }
 
-  const doc = snap.docs[0];
-  const data = doc.data();
-
-  console.log("Servicio encontrado en Firestore, id:", doc.id);
+  const data = docSnap.data();
 
   return {
     token,
-    serviceId: data.serviceId || doc.id,
+    serviceId: data.id || docSnap.id,
+
+    // Datos del cliente
     name: data.clientName || data.name || "",
-    phone: data.clientPhone || data.phone || "",
+    phone: data.phone || data.phoneNumber || "",
+
+    // Dirección
     address: data.address || "",
     city: data.city || "",
     zip: data.zip || data.postalCode || "",
@@ -288,7 +312,7 @@ async function getServiceByToken(token) {
 // =============== FIRESTORE: CARGAR CITAS EXISTENTES (DE MOMENTO VACÍO) ===============
 
 async function getAppointmentsForDayBlock(dayDate, block) {
-  // Más adelante podemos enganchar aquí tus citas reales.
+  // Más adelante podremos enganchar aquí tus citas reales del día.
   // De momento, lo dejamos vacío (como si no hubiera citas ya asignadas).
   return [];
 }
@@ -305,12 +329,17 @@ async function createAppointmentRequest(payload) {
     createdAtTimestamp: admin.firestore.Timestamp.fromDate(now),
   };
 
-  const docRef = await db.collection("onlineAppointmentRequests").add(docToSave);
+  const docRef = db
+    .collection("onlineAppointmentRequests")
+    .add(docToSave);
 
-  console.log("Solicitud de cita guardada en Firestore con id:", docRef.id);
+  console.log(
+    "Solicitud de cita guardada en Firestore con id:",
+    (await docRef).id
+  );
 
   return {
-    requestId: docRef.id,
+    requestId: (await docRef).id,
   };
 }
 
@@ -326,7 +355,9 @@ app.post("/client-from-token", async (req, res) => {
 
     const service = await getServiceByToken(token);
     if (!service) {
-      return res.status(404).json({ error: "Servicio no encontrado para ese token" });
+      return res
+        .status(404)
+        .json({ error: "Servicio no encontrado para ese token" });
     }
 
     return res.json({
@@ -349,14 +380,18 @@ app.post("/availability-smart", async (req, res) => {
     const { token, block, rangeDays } = req.body;
 
     if (!token || !block) {
-      return res.status(400).json({ error: "Faltan parámetros (token o block)" });
+      return res
+        .status(400)
+        .json({ error: "Faltan parámetros (token o block)" });
     }
 
     const range = typeof rangeDays === "number" ? rangeDays : 14;
 
     const service = await getServiceByToken(token);
     if (!service) {
-      return res.status(404).json({ error: "Servicio no encontrado para ese token" });
+      return res
+        .status(404)
+        .json({ error: "Servicio no encontrado para ese token" });
     }
 
     const fullAddress =
@@ -424,7 +459,9 @@ app.post("/appointment-request", async (req, res) => {
 
     const service = await getServiceByToken(token);
     if (!service) {
-      return res.status(404).json({ error: "Servicio no encontrado para ese token" });
+      return res
+        .status(404)
+        .json({ error: "Servicio no encontrado para ese token" });
     }
 
     const payload = {
