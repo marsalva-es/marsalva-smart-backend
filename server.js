@@ -215,8 +215,8 @@ async function isSlotFeasible(slot, newLocation, block, existingAppointmentsForB
 // TODO: cambia estas funciones para conectar con tu BD real
 
 async function getServiceByToken(token) {
-  // Aquí deberías buscar en tu BD usando el token
-  // De momento: simulado
+  // Aquí deberías buscar en tu BD usando el token.
+  // De momento: datos simulados para probar.
   return {
     token,
     serviceId: "SV-" + token.slice(0, 6),
@@ -229,13 +229,13 @@ async function getServiceByToken(token) {
 }
 
 async function getAppointmentsForDayBlock(dayDate, block) {
-  // Aquí deberías devolver las citas reales de ese día y bloque
-  // De momento, ninguna: array vacío
+  // Aquí deberías devolver las citas reales de ese día y bloque.
+  // De momento, ninguna: array vacío.
   return [];
 }
 
 async function createAppointmentRequest(payload) {
-  // Aquí deberías guardar en tu BD (colección de "solicitudes online")
+  // Aquí deberías guardar en tu BD (colección de "solicitudes online").
   console.log("Creando solicitud de cita pendiente:", payload);
   return {
     requestId: "REQ-" + Date.now(),
@@ -244,6 +244,7 @@ async function createAppointmentRequest(payload) {
 
 // =============== ENDPOINTS ===============
 
+// 1) Sacar datos del cliente a partir del token
 app.post("/client-from-token", async (req, res) => {
   try {
     const { token } = req.body;
@@ -270,6 +271,7 @@ app.post("/client-from-token", async (req, res) => {
   }
 });
 
+// 2) Devolver huecos inteligentes (mañana/tarde) para los próximos días
 app.post("/availability-smart", async (req, res) => {
   try {
     const { token, block, rangeDays } = req.body;
@@ -333,6 +335,7 @@ app.post("/availability-smart", async (req, res) => {
   }
 });
 
+// 3) Crear solicitud de cita pendiente
 app.post("/appointment-request", async (req, res) => {
   try {
     const { token, block, date, startTime, endTime } = req.body;
