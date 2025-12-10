@@ -9,14 +9,27 @@ const fetch = (...args) =>
 // Firebase Admin
 const admin = require("firebase-admin");
 
+// ✅ INICIALIZACIÓN FIREBASE: usando PRIVATE_KEY con \n (texto) y luego .replace()
 if (!admin.apps.length) {
+  const projectId = process.env.FIREBASE_PROJECT_ID;
+  const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
+  const rawPrivateKey = process.env.FIREBASE_PRIVATE_KEY;
+
+  console.log("🚀 Marsalva Smart Backend arrancando...");
+  console.log("   Firebase Project:", projectId);
+  console.log("   Tiene clientEmail:", !!clientEmail);
+  console.log("   Tiene privateKey:", !!rawPrivateKey);
+
+  if (!projectId || !clientEmail || !rawPrivateKey) {
+    throw new Error("Faltan variables de entorno de Firebase (PROJECT_ID / CLIENT_EMAIL / PRIVATE_KEY)");
+  }
+
   admin.initializeApp({
     credential: admin.credential.cert({
-      projectId: process.env.FIREBASE_PROJECT_ID,
-      clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-      // 🔥 IMPORTANTE: aquí usamos la clave TAL CUAL viene de la variable de entorno,
-      // en formato PEM con saltos de línea reales.
-      privateKey: process.env.FIREBASE_PRIVATE_KEY,
+      projectId,
+      clientEmail,
+      // 🔥 AQUÍ es donde convertimos los '\n' de texto en saltos de línea reales
+      privateKey: rawPrivateKey.replace(/\\n/g, "\n"),
     }),
   });
 }
@@ -52,9 +65,7 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-console.log("🚀 Marsalva Smart Backend arrancando...");
 console.log("   Google API Key presente:", !!GOOGLE_MAPS_API_KEY);
-console.log("   Firebase Project:", process.env.FIREBASE_PROJECT_ID);
 
 // =============== UTILIDADES GENERALES ===============
 
@@ -241,14 +252,6 @@ async function isSlotFeasible(slot, newLocation, block, existingAppointmentsForB
 
 // =============== FIRESTORE: OBTENER SERVICIO POR TOKEN ===============
 
-/**
- * Busca en Firestore un servicio cuyo campo "token" coincida con el token de la URL.
- *
- * IMPORTANTE:
- * - Cambia "services" por el nombre real de tu colección.
- * - Cambia "token" por el nombre real del campo que guarda el token (p.ej. "publicToken").
- * - Ajusta nombres de campos (clientName, phone, etc.) según tu estructura.
- */
 async function getServiceByToken(token) {
   const COLLECTION_NAME = "services"; // cámbialo si tu colección se llama distinto
   const TOKEN_FIELD = "token";        // cámbialo si el campo se llama p.ej. "publicToken"
