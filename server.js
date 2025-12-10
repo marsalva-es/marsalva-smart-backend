@@ -54,7 +54,7 @@ const AFTERNOON_END = 20; // 20:00;
 
 // Duraciones (minutos)
 const SLOT_MINUTES = 60;
-const SERVICE_MINUTES_DEFAULT = 60;
+const SERVICE_MINUTES_DEFAULT = 60; // mínimo 1h
 const TRAVEL_MARGIN_MINUTES = 10;
 
 // Clave de Google (en Render → Environment → GOOGLE_MAPS_API_KEY)
@@ -210,28 +210,22 @@ function generateSlotsForDayAndBlock(dayDate, block) {
 
 // =============== LÓGICA DE RUTA: VERSIÓN SIMPLE (SIN SOLAPES) ===============
 
-// Versión simple: solo bloquea huecos que se solapan con citas existentes
+// Solo bloquea huecos que se solapan con citas existentes
 async function isSlotFeasible(
   slot,
   newLocation,
   block,
   existingAppointmentsForBlock
 ) {
-  // slot.start y slot.end son el intervalo propuesto (ej. 17:00–18:00)
-
   for (const appt of existingAppointmentsForBlock) {
-    // appt.start / appt.end vienen de Firestore (campo date + duration)
     const overlap =
       slot.start < appt.end && // empieza antes de que termine la otra
       slot.end > appt.start;   // y termina después de que empiece la otra
 
     if (overlap) {
-      // Hay solape con una cita existente → NO es viable
       return false;
     }
   }
-
-  // Si no se solapa con ninguna, lo consideramos libre
   return true;
 }
 
@@ -310,11 +304,14 @@ async function getAppointmentsForDayBlock(dayDate, block) {
     // Solo citas en el bloque (mañana/tarde)
     if (hour < blockStartHour || hour >= blockEndHour) return;
 
-    // Duración de la cita
-    const duration =
+    // Duración de la cita:
+    // - si hay duration numérico lo usamos
+    // - PERO siempre mínimo 60 min (SERVICE_MINUTES_DEFAULT)
+    const rawDuration =
       typeof data.duration === "number"
         ? data.duration
         : SERVICE_MINUTES_DEFAULT;
+    const duration = Math.max(rawDuration, SERVICE_MINUTES_DEFAULT);
 
     const end = addMinutes(start, duration);
 
@@ -325,8 +322,6 @@ async function getAppointmentsForDayBlock(dayDate, block) {
       id: doc.id,
       start,
       end,
-      // de momento usamos HOME_ALGECIRAS como ubicación,
-      // así al menos se bloquean los huecos por hora
       location: HOME_ALGECIRAS,
       block,
       status: data.status || "unknown",
