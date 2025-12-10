@@ -64,29 +64,16 @@ function addMinutes(date, minutes) {
 }
 
 /**
- * Devuelve un array con 'rangeDays' días LABORABLES (lunes a viernes)
- * a partir de hoy (incluido hoy si es laborable).
+ * Devuelve un array con los próximos 'rangeDays' días naturales
+ * (luego filtramos fines de semana en /availability-smart).
  */
 function getNextDays(rangeDays) {
   const days = [];
   const today = getDateOnly(new Date());
-  let added = 0;
-  let offset = 0;
-
-  // Vamos avanzando hasta tener 'rangeDays' días laborables
-  while (added < rangeDays) {
-    const d = new Date(today.getTime() + offset * 24 * 60 * 60000);
-    const dayOfWeek = d.getDay(); // 0 = domingo, 6 = sábado
-
-    if (dayOfWeek !== 0 && dayOfWeek !== 6) {
-      // Solo añadimos lunes (1) a viernes (5)
-      days.push(d);
-      added++;
-    }
-
-    offset++;
+  for (let i = 0; i < rangeDays; i++) {
+    const d = new Date(today.getTime() + i * 24 * 60 * 60000);
+    days.push(d);
   }
-
   return days;
 }
 
@@ -181,12 +168,6 @@ function generateSlotsForDayAndBlock(dayDate, block) {
 
 // =============== LÓGICA DE RUTA ===============
 
-/**
- * Comprueba si es viable meter una cita nueva (newLocation) en el slot dado,
- * respetando:
- *  - Horario de bloque (mañana/tarde)
- *  - Desplazamientos (ida, entre citas y vuelta a casa)
- */
 async function isSlotFeasible(slot, newLocation, block, existingAppointmentsForBlock) {
   const day = getDateOnly(slot.start);
   const blockStartHour = block === "morning" ? MORNING_START : AFTERNOON_START;
@@ -213,7 +194,6 @@ async function isSlotFeasible(slot, newLocation, block, existingAppointmentsForB
     const arrival = addMinutes(currentTime, travelMinutes + TRAVEL_MARGIN_MINUTES);
 
     if (arrival > appt.end) {
-      // Llegamos después de que la cita haya terminado -> no cuadra
       return false;
     }
 
@@ -223,13 +203,11 @@ async function isSlotFeasible(slot, newLocation, block, existingAppointmentsForB
     currentTime = endService;
     currentLocation = appt.location;
 
-    // Si nos salimos del bloque (mañana/tarde), tampoco cuadra
     if (currentTime > blockEndDate) {
       return false;
     }
   }
 
-  // Comprobar que hay tiempo de volver a casa dentro del bloque
   const travelBackMinutes = await getTravelTimeMinutes(currentLocation, HOME_ALGECIRAS);
   const arrivalHome = addMinutes(currentTime, travelBackMinutes + TRAVEL_MARGIN_MINUTES);
 
@@ -241,13 +219,9 @@ async function isSlotFeasible(slot, newLocation, block, existingAppointmentsForB
 }
 
 // =============== "BASE DE DATOS" SIMULADA ===============
-//
-// Estas funciones están de prueba. Luego las engancharás a tu BD real
-// (siniestros, citas, etc.)
 
 async function getServiceByToken(token) {
   // TODO: buscar en tu BD usando el token
-  // De momento: datos simulados
   return {
     token,
     serviceId: "SV-" + token.slice(0, 6),
@@ -260,13 +234,12 @@ async function getServiceByToken(token) {
 }
 
 async function getAppointmentsForDayBlock(dayDate, block) {
-  // TODO: devolver citas reales de ese día y bloque.
-  // De momento, ninguna (como si no hubiera aún citas ese día).
+  // TODO: devolver citas reales de ese día y bloque
   return [];
 }
 
 async function createAppointmentRequest(payload) {
-  // TODO: guardar en tu BD (colección de "solicitudes online").
+  // TODO: guardar en tu BD (colección de "solicitudes online")
   console.log("Creando solicitud de cita pendiente:", payload);
   return {
     requestId: "REQ-" + Date.now(),
@@ -275,11 +248,6 @@ async function createAppointmentRequest(payload) {
 
 // =============== ENDPOINTS ===============
 
-/**
- * 1) client-from-token
- * Entrada: { token }
- * Salida: { name, phone, address, city, zip, serviceId }
- */
 app.post("/client-from-token", async (req, res) => {
   try {
     const { token } = req.body;
@@ -306,11 +274,6 @@ app.post("/client-from-token", async (req, res) => {
   }
 });
 
-/**
- * 2) availability-smart
- * Entrada: { token, block: "morning"|"afternoon", rangeDays }
- * Salida: { days: [ { date, label, slots: [ { startTime, endTime, label? } ] } ] }
- */
 app.post("/availability-smart", async (req, res) => {
   try {
     const { token, block, rangeDays } = req.body;
@@ -333,10 +296,16 @@ app.post("/availability-smart", async (req, res) => {
       service.city;
 
     const clientLocation = await geocodeAddress(fullAddress);
-    const days = getNextDays(range); // ← solo días laborables
+    const allDays = getNextDays(range);
     const resultDays = [];
 
-    for (const day of days) {
+    for (const day of allDays) {
+      const dayOfWeek = day.getDay(); // 0 = domingo, 6 = sábado
+      // 🚫 Saltamos sábados y domingos SÍ O SÍ
+      if (dayOfWeek === 0 || dayOfWeek === 6) {
+        continue;
+      }
+
       const existingAppointments = await getAppointmentsForDayBlock(day, block);
       const slots = generateSlotsForDayAndBlock(day, block);
       const validSlots = [];
@@ -374,11 +343,6 @@ app.post("/availability-smart", async (req, res) => {
   }
 });
 
-/**
- * 3) appointment-request
- * Entrada: { token, block, date, startTime, endTime }
- * Crea una solicitud pendiente
- */
 app.post("/appointment-request", async (req, res) => {
   try {
     const { token, block, date, startTime, endTime } = req.body;
