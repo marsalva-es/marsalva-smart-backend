@@ -137,7 +137,7 @@ async function geocodeAddress(fullAddress) {
 }
 
 async function getTravelTimeMinutes(origin, destination) {
-  // Si la localización es la misma, no pedimos a Google (viaje 0)
+  // Si la localización es la misma, viaje 0
   if (
     origin.lat === destination.lat &&
     origin.lng === destination.lng
@@ -208,69 +208,30 @@ function generateSlotsForDayAndBlock(dayDate, block) {
   return slots;
 }
 
-// =============== LÓGICA DE RUTA ===============
+// =============== LÓGICA DE RUTA: VERSIÓN SIMPLE (SIN SOLAPES) ===============
 
+// Versión simple: solo bloquea huecos que se solapan con citas existentes
 async function isSlotFeasible(
   slot,
   newLocation,
   block,
   existingAppointmentsForBlock
 ) {
-  const day = getDateOnly(slot.start);
-  const blockStartHour = block === "morning" ? MORNING_START : AFTERNOON_START;
-  const blockEndHour = block === "morning" ? MORNING_END : AFTERNOON_END;
+  // slot.start y slot.end son el intervalo propuesto (ej. 17:00–18:00)
 
-  const newAppointment = {
-    id: "NEW",
-    start: new Date(slot.start),
-    end: addMinutes(slot.start, SERVICE_MINUTES_DEFAULT),
-    location: newLocation,
-    block,
-    status: "pending",
-  };
+  for (const appt of existingAppointmentsForBlock) {
+    // appt.start / appt.end vienen de Firestore (campo date + duration)
+    const overlap =
+      slot.start < appt.end && // empieza antes de que termine la otra
+      slot.end > appt.start;   // y termina después de que empiece la otra
 
-  const allAppointments = [...existingAppointmentsForBlock, newAppointment];
-  allAppointments.sort((a, b) => a.start.getTime() - b.start.getTime());
-
-  let currentTime = buildDateWithHour(day, blockStartHour);
-  let currentLocation = HOME_ALGECIRAS;
-  const blockEndDate = buildDateWithHour(day, blockEndHour);
-
-  for (const appt of allAppointments) {
-    const travelMinutes = await getTravelTimeMinutes(
-      currentLocation,
-      appt.location
-    );
-    const arrival = addMinutes(currentTime, travelMinutes + TRAVEL_MARGIN_MINUTES);
-
-    if (arrival > appt.end) {
-      return false;
-    }
-
-    const startService = arrival > appt.start ? arrival : appt.start;
-    const endService = addMinutes(startService, SERVICE_MINUTES_DEFAULT);
-
-    currentTime = endService;
-    currentLocation = appt.location;
-
-    if (currentTime > blockEndDate) {
+    if (overlap) {
+      // Hay solape con una cita existente → NO es viable
       return false;
     }
   }
 
-  const travelBackMinutes = await getTravelTimeMinutes(
-    currentLocation,
-    HOME_ALGECIRAS
-  );
-  const arrivalHome = addMinutes(
-    currentTime,
-    travelBackMinutes + TRAVEL_MARGIN_MINUTES
-  );
-
-  if (arrivalHome > blockEndDate) {
-    return false;
-  }
-
+  // Si no se solapa con ninguna, lo consideramos libre
   return true;
 }
 
@@ -357,7 +318,7 @@ async function getAppointmentsForDayBlock(dayDate, block) {
 
     const end = addMinutes(start, duration);
 
-    // Si tuvieras un campo de estado podrías filtrar anuladas aquí:
+    // Aquí podrías filtrar anuladas si tienes un campo de estado:
     // if (data.status === "cancelled" || data.status === "anulado") return;
 
     appointments.push({
@@ -587,9 +548,8 @@ function buildPrettyDayLabel(date, block) {
   const d = date.getDate();
   const diaSemana = dias[date.getDay()];
   const mes = meses[date.getMonth()];
-  const bloqueTexto = block === "mañana" || block === "morning"
-    ? "mañana"
-    : "tarde";
+  const bloqueTexto =
+    block === "mañana" || block === "morning" ? "mañana" : "tarde";
 
   return `${diaSemana} ${d} de ${mes} (${bloqueTexto})`;
 }
