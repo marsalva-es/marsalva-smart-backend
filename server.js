@@ -235,30 +235,55 @@ async function isSlotFeasible(slot, newLocation, block, existingAppointmentsForB
   return true;
 }
 
-// =============== "BASE DE DATOS" SIMULADA (PARTE) ===============
-//
-// Estas dos funciones siguen de prueba. Más adelante las conectamos
-// a tus colecciones reales.
+// =============== FIRESTORE: OBTENER SERVICIO POR TOKEN ===============
 
+/**
+ * Busca en Firestore un servicio cuyo campo "token" coincida con el token de la URL.
+ *
+ * IMPORTANTE:
+ * - Cambia "services" por el nombre real de tu colección.
+ * - Cambia "token" por el nombre real del campo que guarda el token.
+ * - Ajusta nombres de campos (clientName, phone, etc.) según tu estructura.
+ */
 async function getServiceByToken(token) {
-  // TODO: buscar en tu BD usando el token
+  // Colección donde guardas tus servicios / siniestros
+  const COLLECTION_NAME = "services";      // cámbialo si tu colección se llama distinto
+  const TOKEN_FIELD = "token";            // cámbialo si el campo se llama p.ej. "publicToken"
+
+  const snap = await db
+    .collection(COLLECTION_NAME)
+    .where(TOKEN_FIELD, "==", token)
+    .limit(1)
+    .get();
+
+  if (snap.empty) {
+    console.warn("No se ha encontrado servicio para token:", token);
+    return null;
+  }
+
+  const doc = snap.docs[0];
+  const data = doc.data();
+
   return {
     token,
-    serviceId: "SV-" + token.slice(0, 6),
-    name: "Cliente de prueba",
-    phone: "600000000",
-    address: "Calle Ejemplo 1",
-    city: "Algeciras",
-    zip: "11201",
+    serviceId: data.serviceId || doc.id,
+    name: data.clientName || data.name || "",
+    phone: data.clientPhone || data.phone || "",
+    address: data.address || "",
+    city: data.city || "",
+    zip: data.zip || data.postalCode || "",
   };
 }
 
+// =============== FIRESTORE: CARGAR CITAS EXISTENTES (DE MOMENTO VACÍO) ===============
+
 async function getAppointmentsForDayBlock(dayDate, block) {
-  // TODO: devolver citas reales de ese día y bloque
+  // Más adelante podemos enganchar aquí tus citas reales.
+  // De momento, lo dejamos vacío (como si no hubiera citas ya asignadas).
   return [];
 }
 
-// =============== AQUÍ SÍ USAMOS FIRESTORE ===============
+// =============== FIRESTORE: GUARDAR SOLICITUD ONLINE ===============
 
 async function createAppointmentRequest(payload) {
   // Guardamos la solicitud en Firestore, colección "onlineAppointmentRequests"
