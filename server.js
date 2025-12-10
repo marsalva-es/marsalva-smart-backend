@@ -137,6 +137,14 @@ async function geocodeAddress(fullAddress) {
 }
 
 async function getTravelTimeMinutes(origin, destination) {
+  // Si la localización es la misma, no pedimos a Google (viaje 0)
+  if (
+    origin.lat === destination.lat &&
+    origin.lng === destination.lng
+  ) {
+    return 0;
+  }
+
   if (!GOOGLE_MAPS_API_KEY) {
     throw new Error("No hay GOOGLE_MAPS_API_KEY configurada");
   }
@@ -271,9 +279,6 @@ async function isSlotFeasible(
 /**
  * Aquí asumimos que el "token" que llega en la URL
  * es el ID del documento en la colección "appointments".
- *
- * Ejemplo:
- *  appointments / 93C4456D-4822-471F-AA37-8864DFC89F4B
  */
 async function getServiceByToken(token) {
   console.log(
@@ -297,11 +302,9 @@ async function getServiceByToken(token) {
   return {
     token,
     serviceId: data.id || docSnap.id,
-
     // Datos del cliente
     name: data.clientName || data.name || "",
     phone: data.phone || data.phoneNumber || "",
-
     // Dirección
     address: data.address || "",
     city: data.city || "",
@@ -309,18 +312,78 @@ async function getServiceByToken(token) {
   };
 }
 
-// =============== FIRESTORE: CARGAR CITAS EXISTENTES (DE MOMENTO VACÍO) ===============
+// =============== FIRESTORE: CARGAR CITAS EXISTENTES PARA EL DÍA/BLOQUE ===============
 
 async function getAppointmentsForDayBlock(dayDate, block) {
-  // Más adelante podremos enganchar aquí tus citas reales del día.
-  // De momento, lo dejamos vacío (como si no hubiera citas ya asignadas).
-  return [];
+  const dayStart = getDateOnly(dayDate);
+  const dayEnd = new Date(dayStart.getTime() + 24 * 60 * 60000);
+
+  const startTs = admin.firestore.Timestamp.fromDate(dayStart);
+  const endTs = admin.firestore.Timestamp.fromDate(dayEnd);
+
+  const blockStartHour = block === "morning" ? MORNING_START : AFTERNOON_START;
+  const blockEndHour = block === "morning" ? MORNING_END : AFTERNOON_END;
+
+  const snap = await db
+    .collection("appointments")
+    .where("date", ">=", startTs)
+    .where("date", "<", endTs)
+    .get();
+
+  const appointments = [];
+
+  snap.forEach((doc) => {
+    const data = doc.data();
+    if (!data.date) return;
+
+    // Firestore Timestamp → Date
+    let start;
+    if (data.date.toDate) {
+      start = data.date.toDate();
+    } else {
+      start = new Date(data.date);
+      if (isNaN(start.getTime())) return;
+    }
+
+    const hour = start.getHours();
+    // Solo citas en el bloque (mañana/tarde)
+    if (hour < blockStartHour || hour >= blockEndHour) return;
+
+    // Duración de la cita
+    const duration =
+      typeof data.duration === "number"
+        ? data.duration
+        : SERVICE_MINUTES_DEFAULT;
+
+    const end = addMinutes(start, duration);
+
+    // Si tuvieras un campo de estado podrías filtrar anuladas aquí:
+    // if (data.status === "cancelled" || data.status === "anulado") return;
+
+    appointments.push({
+      id: doc.id,
+      start,
+      end,
+      // de momento usamos HOME_ALGECIRAS como ubicación,
+      // así al menos se bloquean los huecos por hora
+      location: HOME_ALGECIRAS,
+      block,
+      status: data.status || "unknown",
+    });
+  });
+
+  console.log(
+    `Encontradas ${appointments.length} citas existentes para ${dayStart
+      .toISOString()
+      .slice(0, 10)} bloque ${block}`
+  );
+
+  return appointments;
 }
 
 // =============== FIRESTORE: GUARDAR SOLICITUD ONLINE ===============
 
 async function createAppointmentRequest(payload) {
-  // Guardamos la solicitud en Firestore, colección "onlineAppointmentRequests"
   const now = new Date();
 
   const docToSave = {
@@ -329,17 +392,17 @@ async function createAppointmentRequest(payload) {
     createdAtTimestamp: admin.firestore.Timestamp.fromDate(now),
   };
 
-  const docRef = db
+  const docRef = await db
     .collection("onlineAppointmentRequests")
     .add(docToSave);
 
   console.log(
     "Solicitud de cita guardada en Firestore con id:",
-    (await docRef).id
+    docRef.id
   );
 
   return {
-    requestId: (await docRef).id,
+    requestId: docRef.id,
   };
 }
 
@@ -411,7 +474,10 @@ app.post("/availability-smart", async (req, res) => {
         continue;
       }
 
-      const existingAppointments = await getAppointmentsForDayBlock(day, block);
+      const existingAppointments = await getAppointmentsForDayBlock(
+        day,
+        block
+      );
       const slots = generateSlotsForDayAndBlock(day, block);
       const validSlots = [];
 
@@ -521,7 +587,9 @@ function buildPrettyDayLabel(date, block) {
   const d = date.getDate();
   const diaSemana = dias[date.getDay()];
   const mes = meses[date.getMonth()];
-  const bloqueTexto = block === "morning" ? "mañana" : "tarde";
+  const bloqueTexto = block === "mañana" || block === "morning"
+    ? "mañana"
+    : "tarde";
 
   return `${diaSemana} ${d} de ${mes} (${bloqueTexto})`;
 }
