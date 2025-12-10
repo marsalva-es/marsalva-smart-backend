@@ -32,8 +32,8 @@ const HOME_ALGECIRAS = {
 };
 
 // Horarios
-const MORNING_START = 9;   // 09:00
-const MORNING_END = 14;    // 14:00
+const MORNING_START = 9;    // 09:00
+const MORNING_END = 14;     // 14:00
 const AFTERNOON_START = 16; // 16:00
 const AFTERNOON_END = 20;   // 20:00;
 
@@ -51,6 +51,10 @@ const PORT = process.env.PORT || 10000;
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+console.log("🚀 Marsalva Smart Backend arrancando...");
+console.log("   Google API Key presente:", !!GOOGLE_MAPS_API_KEY);
+console.log("   Firebase Project:", process.env.FIREBASE_PROJECT_ID);
 
 // =============== UTILIDADES GENERALES ===============
 
@@ -242,13 +246,14 @@ async function isSlotFeasible(slot, newLocation, block, existingAppointmentsForB
  *
  * IMPORTANTE:
  * - Cambia "services" por el nombre real de tu colección.
- * - Cambia "token" por el nombre real del campo que guarda el token.
+ * - Cambia "token" por el nombre real del campo que guarda el token (p.ej. "publicToken").
  * - Ajusta nombres de campos (clientName, phone, etc.) según tu estructura.
  */
 async function getServiceByToken(token) {
-  // Colección donde guardas tus servicios / siniestros
-  const COLLECTION_NAME = "services";      // cámbialo si tu colección se llama distinto
-  const TOKEN_FIELD = "token";            // cámbialo si el campo se llama p.ej. "publicToken"
+  const COLLECTION_NAME = "services"; // cámbialo si tu colección se llama distinto
+  const TOKEN_FIELD = "token";        // cámbialo si el campo se llama, por ejemplo, "publicToken"
+
+  console.log("Buscando servicio en Firestore para token:", token);
 
   const snap = await db
     .collection(COLLECTION_NAME)
@@ -263,6 +268,8 @@ async function getServiceByToken(token) {
 
   const doc = snap.docs[0];
   const data = doc.data();
+
+  console.log("Servicio encontrado:", doc.id);
 
   return {
     token,
@@ -488,5 +495,5 @@ app.get("/", (req, res) => {
 // =============== ARRANCAR SERVIDOR ===============
 
 app.listen(PORT, () => {
-  console.log("Servidor escuchando en puerto", PORT);
+  console.log("✅ Servidor escuchando en puerto", PORT);
 });
