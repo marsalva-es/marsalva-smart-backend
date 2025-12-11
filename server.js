@@ -15,7 +15,7 @@ if (!admin.apps.length) {
   const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
   const rawPrivateKey = process.env.FIREBASE_PRIVATE_KEY;
 
-  console.log("🚀 Marsalva Smart Backend arrancando...");
+  console.log("🚀 Marsalva Smart Backend V2 arrancando...");
   console.log("   Firebase Project:", projectId);
   console.log("   Tiene clientEmail:", !!clientEmail);
   console.log("   Tiene privateKey:", !!rawPrivateKey);
@@ -78,7 +78,6 @@ function normalizeBlock(block) {
   if (b.includes("tard") || b.includes("after")) {
     return "afternoon";
   }
-  // por defecto, mañana
   return "morning";
 }
 
@@ -149,13 +148,19 @@ async function geocodeAddress(fullAddress) {
   return result;
 }
 
+// ⚠️ AQUÍ EL CAMBIO IMPORTANTE: ya NO lanzamos errores, devolvemos un valor por defecto
 async function getTravelTimeMinutes(origin, destination) {
+  // Si la localización es la misma, viaje 0
   if (origin.lat === destination.lat && origin.lng === destination.lng) {
     return 0;
   }
 
+  // Si no hay API key, devolvemos un valor fijo
   if (!GOOGLE_MAPS_API_KEY) {
-    throw new Error("No hay GOOGLE_MAPS_API_KEY configurada");
+    console.warn(
+      "No hay GOOGLE_MAPS_API_KEY, usando 20 minutos de viaje por defecto"
+    );
+    return 20;
   }
 
   const origins = `${origin.lat},${origin.lng}`;
@@ -169,23 +174,43 @@ async function getTravelTimeMinutes(origin, destination) {
     "&key=" +
     GOOGLE_MAPS_API_KEY;
 
-  const resp = await fetch(url);
-  if (!resp.ok) {
-    throw new Error("Error al consultar Distance Matrix");
-  }
-  const data = await resp.json();
-  if (data.status !== "OK") {
-    throw new Error("Error en respuesta Distance Matrix");
-  }
+  try {
+    const resp = await fetch(url);
+    if (!resp.ok) {
+      console.warn(
+        "HTTP error llamando a Distance Matrix, usando 20 minutos por defecto"
+      );
+      return 20;
+    }
 
-  const element = data.rows[0].elements[0];
-  if (element.status !== "OK") {
-    throw new Error("No se pudo calcular el tiempo de viaje");
-  }
+    const data = await resp.json();
+    const element = data?.rows?.[0]?.elements?.[0];
 
-  const seconds = element.duration.value;
-  const minutes = Math.ceil(seconds / 60);
-  return minutes;
+    if (
+      data.status !== "OK" ||
+      !element ||
+      element.status !== "OK" ||
+      !element.duration
+    ) {
+      console.warn(
+        "Respuesta no OK de Distance Matrix, usando 20 minutos por defecto",
+        data.status,
+        element && element.status
+      );
+      return 20;
+    }
+
+    const seconds = element.duration.value;
+    const minutes = Math.ceil(seconds / 60);
+    return minutes;
+  } catch (e) {
+    console.warn(
+      "Error llamando a Distance Matrix:",
+      e.message,
+      "→ usando 20 minutos por defecto"
+    );
+    return 20;
+  }
 }
 
 // =============== SLOTS ===============
@@ -380,7 +405,6 @@ async function getAppointmentsForDayBlock(dayDate, rawBlock) {
 
     const hour = start.getHours();
 
-    // Log para debug
     console.log(
       `   Cita ${doc.id} → hora ${hour}, block ${block}, rango ${blockStartHour}-${blockEndHour}`
     );
@@ -490,7 +514,12 @@ app.post("/availability-smart", async (req, res) => {
     }
 
     const normBlock = normalizeBlock(block);
-    console.log("🕒 availability-smart → block recibido:", block, "normalizado:", normBlock);
+    console.log(
+      "🕒 availability-smart → block recibido:",
+      block,
+      "normalizado:",
+      normBlock
+    );
 
     const range = typeof rangeDays === "number" ? rangeDays : 14;
 
@@ -650,5 +679,5 @@ app.get("/", (req, res) => {
 // =============== ARRANCAR SERVIDOR ===============
 
 app.listen(PORT, () => {
-  console.log("✅ Servidor escuchando en puerto", PORT);
+  console.log("🚀 Servidor Marsalva escuchando en", PORT);
 });
