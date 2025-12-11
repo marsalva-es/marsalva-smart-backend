@@ -43,11 +43,9 @@ const SCHEDULE = {
 // ⏱️ TIEMPOS Y REGLAS DE VIAJE
 const SLOT_INTERVAL = 30;         // Ofrecer huecos cada 30 min (9:30, 10:00, 10:30...)
 const SERVICE_DEFAULT_MIN = 60;   // Duración mínima si no se especifica
-const TRAVEL_MARGIN_MINUTES = 15; // Colchón: Aparcar, subir herramientas, saludar.
+const TRAVEL_MARGIN_MINUTES = 15; // Colchón
 
-// 🚫 REGLA ANTI-ZIGZAG (IMPORTANTE)
-// Si el viaje entre cita A y cita B tarda más de X minutos, el sistema dice "NO".
-// Esto evita ir de Algeciras a La Línea y volver. Te obliga a quedarte por la zona.
+// 🚫 REGLA ANTI-ZIGZAG
 const MAX_TRAVEL_ALLOWED_BETWEEN_JOBS = 30; 
 
 // Google API
@@ -58,13 +56,12 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Cachés para ahorrar dinero en Google Maps
+// Cachés
 const geocodeCache = new Map();
 const distanceCache = new Map();
 
 // =============== UTILIDADES DE FECHA (ZONA ESPAÑA) ===============
 
-// Truco para asegurar que siempre calculamos con hora de España
 function getSpainDate(dateInput = new Date()) {
   const d = new Date(dateInput);
   const spainString = d.toLocaleString("en-US", { timeZone: "Europe/Madrid" });
@@ -77,7 +74,6 @@ function getDateOnly(date) {
   return d;
 }
 
-// Crea una fecha base con hora específica
 function setTime(baseDate, hour, minute) {
   const d = new Date(baseDate);
   d.setHours(hour, minute, 0, 0);
@@ -106,7 +102,6 @@ async function geocodeAddress(fullAddress) {
   if (!fullAddress) throw new Error("Dirección vacía");
   if (geocodeCache.has(fullAddress)) return geocodeCache.get(fullAddress);
   
-  // Fallback si no hay API Key
   if (!GOOGLE_MAPS_API_KEY) return HOME_ALGECIRAS;
 
   const url = `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(fullAddress)}&key=${GOOGLE_MAPS_API_KEY}`;
@@ -114,7 +109,7 @@ async function geocodeAddress(fullAddress) {
   try {
     const resp = await fetch(url);
     const data = await resp.json();
-    if (data.status !== "OK" || !data.results.length) return HOME_ALGECIRAS; // Fallback seguro
+    if (data.status !== "OK" || !data.results.length) return HOME_ALGECIRAS;
     
     const loc = data.results[0].geometry.location;
     const result = { lat: loc.lat, lng: loc.lng };
@@ -127,7 +122,6 @@ async function geocodeAddress(fullAddress) {
 }
 
 async function getTravelTimeMinutes(origin, destination) {
-  // Si es la misma ubicación (o muy cerca)
   if (Math.abs(origin.lat - destination.lat) < 0.001 && Math.abs(origin.lng - destination.lng) < 0.001) {
     return 0;
   }
@@ -135,7 +129,7 @@ async function getTravelTimeMinutes(origin, destination) {
   const cacheKey = `${origin.lat},${origin.lng}_${destination.lat},${destination.lng}`;
   if (distanceCache.has(cacheKey)) return distanceCache.get(cacheKey);
 
-  if (!GOOGLE_MAPS_API_KEY) return 20; // Estimación por defecto si no hay API
+  if (!GOOGLE_MAPS_API_KEY) return 20;
 
   const url = `https://maps.googleapis.com/maps/api/distancematrix/json?units=metric&origins=${origin.lat},${origin.lng}&destinations=${destination.lat},${destination.lng}&key=${GOOGLE_MAPS_API_KEY}`;
 
@@ -152,7 +146,7 @@ async function getTravelTimeMinutes(origin, destination) {
   } catch (e) {
     console.error("Error Matrix:", e.message);
   }
-  return 20; // Fallback seguro
+  return 20;
 }
 
 // =============== GENERADOR DE HUECOS ===============
@@ -166,7 +160,6 @@ function generateSlotsForDayAndBlock(dayDate, rawBlock) {
   const endLimit = setTime(dayDate, config.endHour, config.endMinute);
 
   while (current < endLimit) {
-    // Probamos huecos cada 30 minutos
     slots.push(new Date(current));
     current = addMinutes(current, SLOT_INTERVAL);
   }
@@ -180,11 +173,9 @@ async function isSlotFeasible(slotStart, newLocation, newDuration, rawBlock, exi
   const config = SCHEDULE[block];
   const day = getDateOnly(slotStart);
   
-  // Limites del bloque
   const blockStartTime = setTime(day, config.startHour, config.startMinute);
   const blockEndTime = setTime(day, config.endHour, config.endMinute);
 
-  // 1. Crear candidato
   const newAppt = {
     id: "NEW",
     start: new Date(slotStart),
@@ -193,53 +184,34 @@ async function isSlotFeasible(slotStart, newLocation, newDuration, rawBlock, exi
     duration: newDuration
   };
 
-  // Validación básica: ¿Termina antes de cerrar el turno?
   if (newAppt.end > blockEndTime) return false;
 
-  // 2. Mezclar con ruta actual y ordenar
   const dailyRoute = [...existingAppointments, newAppt].sort((a, b) => a.start - b.start);
 
-  // 3. Validar superposiciones (Overlap)
   for (let i = 0; i < dailyRoute.length - 1; i++) {
     const current = dailyRoute[i];
     const next = dailyRoute[i+1];
-    // Si la actual termina DESPUÉS de que empiece la siguiente -> MAL
-    if (current.end > next.start) return false; 
+    if (current.end > next.start) return false;
   }
 
-  // 4. SIMULACIÓN DE VIAJE (TSP simplificado)
-  // Empezamos simulando desde Casa o desde donde estemos a las 8:00
   let currentLocation = HOME_ALGECIRAS;
-  
-  // Hora de "salida" de casa. Tú dices que sales a las 8:00.
-  // Pero la primera cita es a las 9:30.
-  // Verificaremos que el viaje Casa -> Primera Cita sea posible saliendo a las 8:00.
   let simulatedTime = setTime(day, 8, 0); 
 
   for (let i = 0; i < dailyRoute.length; i++) {
     const appt = dailyRoute[i];
     
-    // Calcular viaje desde la ubicación anterior (o casa)
     const travelMinutes = await getTravelTimeMinutes(currentLocation, appt.location);
     
-    // REGLA DE ORO: No desplazamientos locos entre clientes
-    // Si NO es el primer viaje desde casa (ese puede ser largo si vas a Tarifa),
-    // y el viaje entre clientes supera el máximo permitido... BLOQUEAR.
     if (i > 0 && travelMinutes > MAX_TRAVEL_ALLOWED_BETWEEN_JOBS) {
-      // Ejemplo: De La Línea (appt anterior) a Algeciras (nueva) son > 30 min? -> FUERA.
       return false; 
     }
 
-    // Hora a la que llegaríamos
     const arrivalTime = addMinutes(simulatedTime, travelMinutes + TRAVEL_MARGIN_MINUTES);
 
-    // ¿Llegamos tarde al inicio de la cita?
     if (arrivalTime > appt.start) {
-      return false; // Imposible llegar
+      return false;
     }
 
-    // Actualizamos simulación: Hacemos el trabajo
-    // La hora actual pasa a ser cuando termina este trabajo
     simulatedTime = appt.end;
     currentLocation = appt.location;
   }
@@ -253,15 +225,22 @@ async function getServiceByToken(token) {
   const doc = await db.collection("appointments").doc(token).get();
   if (!doc.exists) return null;
   const d = doc.data();
+
+  let originalDate = null;
+  if (d.date && typeof d.date.toDate === "function") {
+    originalDate = d.date.toDate();
+  }
+
   return { 
-    token, 
+    token,
+    serviceId: doc.id,
     address: d.address || "", 
     city: d.city || "", 
     zip: d.zip || "",
     name: d.clientName || "Cliente",
-    // Si la cita de origen tiene una duración estimada, la usamos
-    // Si no, por defecto 60 min.
-    duration: d.estimatedDuration || SERVICE_DEFAULT_MIN 
+    phone: d.phone || d.phoneNumber || "",
+    duration: d.estimatedDuration || d.duration || SERVICE_DEFAULT_MIN,
+    originalDate
   };
 }
 
@@ -269,7 +248,6 @@ async function getAppointmentsForDay(dateObj, block) {
   const startD = getDateOnly(dateObj);
   const endD = addMinutes(startD, 24 * 60);
 
-  // Convertimos a Timestamp de Firestore
   const startTs = admin.firestore.Timestamp.fromDate(startD);
   const endTs = admin.firestore.Timestamp.fromDate(endD);
 
@@ -281,9 +259,8 @@ async function getAppointmentsForDay(dateObj, block) {
   const appts = [];
   for (const doc of snap.docs) {
     const data = doc.data();
-    const apptDate = data.date.toDate(); // Firestore Timestamp -> JS Date
+    const apptDate = data.date.toDate();
     
-    // Filtramos por bloque horario
     const hour = apptDate.getHours();
     const isMorning = hour < 15;
     
@@ -291,7 +268,6 @@ async function getAppointmentsForDay(dateObj, block) {
     if (normalizeBlock(block) === "afternoon" && isMorning) continue;
 
     let loc = HOME_ALGECIRAS;
-    // Intentamos geolocalizar la cita existente
     if (data.address) {
        try { 
          const full = data.address + (data.city ? ", " + data.city : "");
@@ -299,7 +275,6 @@ async function getAppointmentsForDay(dateObj, block) {
        } catch(e){}
     }
 
-    // IMPORTANTE: Leemos la duración real de la cita existente
     const realDuration = data.duration || SERVICE_DEFAULT_MIN;
 
     appts.push({
@@ -313,6 +288,55 @@ async function getAppointmentsForDay(dateObj, block) {
   return appts;
 }
 
+// =============== HELPER: CREAR CAMBIO DE CITA PARA LA APP ===============
+
+async function createChangeRequestForApp({ token, service, finalDate, startTime, endTime }) {
+  const [h, m] = startTime.split(":").map(n => parseInt(n, 10));
+  const startHour = h;
+  const block = startHour < 15 ? "morning" : "afternoon";
+
+  let durationMinutes;
+  if (endTime) {
+    const [eh, em] = endTime.split(":").map(n => parseInt(n, 10));
+    durationMinutes = (eh * 60 + em) - (h * 60 + m);
+  } else {
+    durationMinutes = service?.duration || SERVICE_DEFAULT_MIN;
+  }
+
+  const computedEnd = endTime || formatTime(addMinutes(finalDate, durationMinutes));
+
+  const docData = {
+    token,
+    appointmentId: service ? service.serviceId : null,
+    requestedDate: admin.firestore.Timestamp.fromDate(finalDate),
+    requestedDateString: finalDate.toISOString().slice(0,10),
+    requestedStartTime: startTime,
+    requestedEndTime: computedEnd,
+    requestedBlock: block,
+    clientName: service ? service.name : "Desconocido",
+    clientPhone: service ? service.phone : "",
+    address: service ? service.address : "",
+    city: service ? service.city : "",
+    zip: service ? service.zip : "",
+    originalDate: service?.originalDate
+      ? admin.firestore.Timestamp.fromDate(service.originalDate)
+      : null,
+    status: "pending",
+    source: "smartBooking",
+    createdAt: admin.firestore.FieldValue.serverTimestamp()
+  };
+
+  // 👉 Colección que lee la app en el apartado "Cambios de cita"
+  const changeRef = await db
+    .collection("appointmentChangeRequests")
+    .add(docData);
+
+  // Opcional: lo dejamos también en onlineAppointmentRequests como histórico
+  await db.collection("onlineAppointmentRequests").add(docData);
+
+  return changeRef.id;
+}
+
 // =============== ENDPOINTS ===============
 
 app.post("/availability-smart", async (req, res) => {
@@ -323,21 +347,18 @@ app.post("/availability-smart", async (req, res) => {
     const service = await getServiceByToken(token);
     if (!service) return res.status(404).json({ error: "Token inválido" });
 
-    // Geolocalizamos al NUEVO cliente
     const fullAddr = `${service.address}, ${service.city}, ${service.zip}`;
     const clientLoc = await geocodeAddress(fullAddr);
     
-    // Duración de ESTE nuevo servicio (si no está definida, 60 min)
     const newServiceDuration = service.duration || SERVICE_DEFAULT_MIN;
 
     const resultDays = [];
     const today = getSpainDate();
     
-    // Iteramos los próximos días
     for (let i = 0; i < range; i++) {
       const day = addMinutes(today, i * 24 * 60);
       const dayNum = day.getDay();
-      if (dayNum === 0 || dayNum === 6) continue; // Fin de semana libre
+      if (dayNum === 0 || dayNum === 6) continue;
 
       const existingAppts = await getAppointmentsForDay(day, block);
       const possibleStartTimes = generateSlotsForDayAndBlock(day, block);
@@ -345,7 +366,6 @@ app.post("/availability-smart", async (req, res) => {
       const validSlots = [];
 
       for (const slotStart of possibleStartTimes) {
-        // No mostrar horas pasadas hoy
         if (slotStart < today) continue;
 
         const feasible = await isSlotFeasible(
@@ -382,31 +402,32 @@ app.post("/availability-smart", async (req, res) => {
 });
 
 app.post("/appointment-request", async (req, res) => {
-  const { token, date, startTime, endTime } = req.body;
-  
-  if (!token || !date || !startTime) return res.status(400).json({error: "Datos faltantes"});
+  try {
+    const { token, date, startTime, endTime } = req.body;
+    if (!token || !date || !startTime) {
+      return res.status(400).json({ error: "Datos faltantes" });
+    }
 
-  // Construir fecha completa
-  const [h, m] = startTime.split(":");
-  const finalDate = new Date(date);
-  finalDate.setHours(parseInt(h), parseInt(m), 0, 0);
-  
-  // Calcular duración basada en start/end o default
-  // Esto es solo para guardar el registro
-  
-  const service = await getServiceByToken(token);
+    // Construimos la fecha completa con la hora elegida
+    const [h, m] = startTime.split(":");
+    const finalDate = new Date(date);
+    finalDate.setHours(parseInt(h, 10), parseInt(m, 10), 0, 0);
 
-  const docRef = await db.collection("onlineAppointmentRequests").add({
-    token,
-    serviceId: service ? service.serviceId : null,
-    clientName: service ? service.name : "Desconocido",
-    date: admin.firestore.Timestamp.fromDate(finalDate),
-    requestedTime: startTime,
-    status: "pending",
-    createdAt: admin.firestore.FieldValue.serverTimestamp()
-  });
+    const service = await getServiceByToken(token);
 
-  res.json({ ok: true, id: docRef.id });
+    const changeId = await createChangeRequestForApp({
+      token,
+      service,
+      finalDate,
+      startTime,
+      endTime
+    });
+
+    res.json({ ok: true, id: changeId });
+  } catch (e) {
+    console.error("Error en /appointment-request:", e);
+    res.status(500).json({ error: "Error interno" });
+  }
 });
 
 // Endpoint auxiliar para ver datos del cliente
