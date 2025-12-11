@@ -47,15 +47,15 @@ const HOME_ALGECIRAS = {
 };
 
 // Horarios
-const MORNING_START = 9; // 09:00
-const MORNING_END = 14; // 14:00
+const MORNING_START = 9;  // 09:00
+const MORNING_END = 14;   // 14:00
 const AFTERNOON_START = 16; // 16:00
-const AFTERNOON_END = 20; // 20:00;
+const AFTERNOON_END = 20;   // 20:00
 
 // Duraciones (minutos)
-const SLOT_MINUTES = 60;
-const SERVICE_MINUTES_DEFAULT = 60; // mínimo 1h
-const TRAVEL_MARGIN_MINUTES = 10;
+const SLOT_MINUTES = 60;              // duración de cada hueco mostrado
+const SERVICE_MINUTES_DEFAULT = 60;   // mínimo 1h de servicio
+const TRAVEL_MARGIN_MINUTES = 10;     // margen extra por viaje
 
 // Clave de Google (en Render → Environment → GOOGLE_MAPS_API_KEY)
 const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY || "";
@@ -69,7 +69,7 @@ app.use(express.json());
 
 console.log("   Google API Key presente:", !!GOOGLE_MAPS_API_KEY);
 
-// Cache sencilla en memoria para geocoding
+// Cache simple en memoria para geocoding
 const geocodeCache = new Map();
 
 // =============== UTILIDADES GENERALES ===============
@@ -151,10 +151,7 @@ async function geocodeAddress(fullAddress) {
 
 async function getTravelTimeMinutes(origin, destination) {
   // Si la localización es la misma, viaje 0
-  if (
-    origin.lat === destination.lat &&
-    origin.lng === destination.lng
-  ) {
+  if (origin.lat === destination.lat && origin.lng === destination.lng) {
     return 0;
   }
 
@@ -221,7 +218,7 @@ function generateSlotsForDayAndBlock(dayDate, block) {
   return slots;
 }
 
-// =============== LÓGICA DE RUTA: EVITAR SOLAPES Y DEMASIADOS VIAJES ===============
+// =============== LÓGICA DE RUTA: BLOQUEA SOLAPES + VIAJES ===============
 
 async function isSlotFeasible(
   slot,
@@ -229,11 +226,39 @@ async function isSlotFeasible(
   block,
   existingAppointmentsForBlock
 ) {
+  // 0) Bloqueo duro: si el hueco pisa una cita, fuera.
+  for (const appt of existingAppointmentsForBlock) {
+    const overlap =
+      slot.start < appt.end && // empieza antes de que termine la otra
+      slot.end > appt.start;   // y termina después de que empiece la otra
+
+    if (overlap) {
+      return false;
+    }
+  }
+
+  // 1) Comprobación de ruta con todas las citas + la nueva
   const day = getDateOnly(slot.start);
-  const blockStartHour = block === "morning" ? MORNING_START : AFTERNOON_START;
-  const blockEndHour = block === "morning" ? MORNING_END : AFTERNOON_END;
+  const today = getDateOnly(new Date());
+
+  const blockStartHour =
+    block === "morning" ? MORNING_START : AFTERNOON_START;
+  const blockEndHour =
+    block === "morning" ? MORNING_END : AFTERNOON_END;
+
   const blockStartDate = buildDateWithHour(day, blockStartHour);
   const blockEndDate = buildDateWithHour(day, blockEndHour);
+
+  let currentTime = new Date(blockStartDate);
+  let currentLocation = HOME_ALGECIRAS;
+
+  // Si es hoy, no empezamos antes de ahora
+  if (day.getTime() === today.getTime()) {
+    const now = new Date();
+    if (now > currentTime) {
+      currentTime = now;
+    }
+  }
 
   // Cita nueva (la que está probando el cliente)
   const newAppointment = {
@@ -249,17 +274,13 @@ async function isSlotFeasible(
     newAppointment.durationMinutes
   );
 
-  // Todas las citas del bloque + la nueva
+  // Juntamos todas las citas del bloque
   const allAppointments = [...existingAppointmentsForBlock, newAppointment];
   allAppointments.sort((a, b) => a.start.getTime() - b.start.getTime());
-
-  let currentTime = new Date(blockStartDate);
-  let currentLocation = HOME_ALGECIRAS;
 
   for (const appt of allAppointments) {
     const duration = appt.durationMinutes || SERVICE_MINUTES_DEFAULT;
 
-    // Tiempo de viaje desde la posición actual hasta la cita
     const travelMinutes = await getTravelTimeMinutes(
       currentLocation,
       appt.location || HOME_ALGECIRAS
@@ -269,27 +290,23 @@ async function isSlotFeasible(
       travelMinutes + TRAVEL_MARGIN_MINUTES
     );
 
-    const apptEndByDuration = addMinutes(appt.start, duration);
-
-    // Si llegaríamos después de que termine el intervalo de esa cita → no es viable
-    if (arrival > apptEndByDuration) {
+    // No podemos llegar más tarde que la hora de inicio de la cita
+    if (arrival > appt.start) {
       return false;
     }
 
-    // Empezamos cuando lleguemos o a la hora de la cita, lo que sea más tarde
-    const serviceStart = arrival > appt.start ? arrival : appt.start;
-    const serviceEnd = addMinutes(serviceStart, duration);
+    // La cita termina a partir de su hora de inicio (no la movemos)
+    const serviceEnd = addMinutes(appt.start, duration);
 
     currentTime = serviceEnd;
     currentLocation = appt.location || HOME_ALGECIRAS;
 
-    // Si nos salimos del bloque (mañana/tarde) → no es viable
     if (currentTime > blockEndDate) {
       return false;
     }
   }
 
-  // Volver a casa al final del bloque
+  // Volver a casa
   const travelBackMinutes = await getTravelTimeMinutes(
     currentLocation,
     HOME_ALGECIRAS
@@ -381,26 +398,25 @@ async function getAppointmentsForDayBlock(dayDate, block) {
     // Solo citas en el bloque (mañana/tarde)
     if (hour < blockStartHour || hour >= blockEndHour) continue;
 
-    // Duración de la cita:
+    // Duración:
     // - si hay duration numérico lo usamos
-    // - PERO siempre mínimo 60 min (SERVICE_MINUTES_DEFAULT)
+    // - pero siempre mínimo 60 min
     const rawDuration =
       typeof data.duration === "number"
         ? data.duration
         : SERVICE_MINUTES_DEFAULT;
     const duration = Math.max(rawDuration, SERVICE_MINUTES_DEFAULT);
-
     const end = addMinutes(start, duration);
 
-    // Geolocalizamos la dirección real del servicio
+    // Dirección REAL (en tu caso siempre hay address)
+    const fullAddress = data.address; // ya sabemos que siempre viene
     let location = HOME_ALGECIRAS;
     try {
-      if (data.address) {
-        location = await geocodeAddress(data.address);
-      }
+      location = await geocodeAddress(fullAddress);
     } catch (e) {
       console.warn(
         "No se pudo geocodificar dirección de cita, usando HOME_ALGECIRAS:",
+        fullAddress,
         e.message
       );
     }
@@ -481,7 +497,7 @@ app.post("/client-from-token", async (req, res) => {
   }
 });
 
-// 2) Disponibilidad inteligente (sin fines de semana, sin horas pasadas hoy)
+// 2) Disponibilidad inteligente (sin fines de semana + sin horas pasadas hoy)
 app.post("/availability-smart", async (req, res) => {
   try {
     const { token, block, rangeDays } = req.body;
