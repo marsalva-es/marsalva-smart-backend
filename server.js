@@ -1,4 +1,4 @@
-// server.js (COMPLETO) — Citas + Login Admin + Bloqueos + Fix Timezone/Duración
+// server.js (COMPLETO) — Citas + Login Admin + Bloqueos (FIX VISIBILIDAD) + Fix Timezone
 const express = require("express");
 const cors = require("cors");
 const admin = require("firebase-admin");
@@ -12,7 +12,7 @@ if (!admin.apps.length) {
   const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
   const rawPrivateKey = process.env.FIREBASE_PRIVATE_KEY;
 
-  console.log("🚀 Marsalva Smart Backend V4 (Citas + Admin Blocks) arrancando...");
+  console.log("🚀 Marsalva Smart Backend V4 (FIXED) arrancando...");
 
   if (!projectId || !clientEmail || !rawPrivateKey) {
     console.error("❌ ERROR CRÍTICO: Faltan variables de entorno de Firebase.");
@@ -50,7 +50,7 @@ const MAX_TRAVEL_ALLOWED_BETWEEN_JOBS = 30; // anti-zigzag
 // Google API
 const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY || "";
 
-// Admin login (para WP Config)
+// Admin login
 const ADMIN_USER = process.env.ADMIN_USER || "";
 const ADMIN_PASS = process.env.ADMIN_PASS || "";
 const ADMIN_JWT_SECRET = process.env.ADMIN_JWT_SECRET || "";
@@ -60,7 +60,7 @@ const PORT = process.env.PORT || 10000;
 
 const app = express();
 
-// ✅ CORS con Authorization (NO rompe nada de citas)
+// ✅ CORS con Authorization
 app.use(
   cors({
     origin: true,
@@ -77,7 +77,6 @@ const distanceCache = new Map();
 
 // =============== UTILIDADES FECHA (EUROPE/MADRID) ===============
 
-// Convierte una fecha a “representación Madrid” (Date en runtime, pero calculada con TZ Europe/Madrid)
 function toSpainDate(dateInput = new Date()) {
   const d = new Date(dateInput);
   const spainString = d.toLocaleString("en-US", { timeZone: "Europe/Madrid" });
@@ -126,23 +125,16 @@ function isWeekendES(dateInput) {
   return dayNum === 0 || dayNum === 6;
 }
 
-// =============== DURACIÓN ROBUSTA (evita solapes falsos) ===============
+// =============== DURACIÓN ROBUSTA ===============
 function parseDurationMinutes(value) {
   if (value == null) return SERVICE_DEFAULT_MIN;
-
-  // numérico
   if (typeof value === "number" && isFinite(value)) {
-    // heurística: si viene en segundos (muy grande), lo convertimos
     if (value > 1000) return Math.max(15, Math.round(value / 60));
     return Math.max(15, Math.round(value));
   }
-
-  // string
   if (typeof value === "string") {
     const s = value.trim();
     if (!s) return SERVICE_DEFAULT_MIN;
-
-    // "HH:mm"
     const hm = s.match(/^(\d{1,2})\s*:\s*(\d{1,2})$/);
     if (hm) {
       const hh = parseInt(hm[1], 10);
@@ -150,15 +142,12 @@ function parseDurationMinutes(value) {
       const mins = hh * 60 + mm;
       return mins > 0 ? mins : SERVICE_DEFAULT_MIN;
     }
-
-    // "90"
     const n = Number(s);
     if (!isNaN(n) && isFinite(n)) {
       if (n > 1000) return Math.max(15, Math.round(n / 60));
       return Math.max(15, Math.round(n));
     }
   }
-
   return SERVICE_DEFAULT_MIN;
 }
 
@@ -200,7 +189,6 @@ async function getTravelTimeMinutes(origin, destination) {
   const cacheKey = `${origin.lat},${origin.lng}_${destination.lat},${destination.lng}`;
   if (distanceCache.has(cacheKey)) return distanceCache.get(cacheKey);
 
-  // Fallback razonable si no hay API Key
   if (!GOOGLE_MAPS_API_KEY) return 20;
 
   const url = `https://maps.googleapis.com/maps/api/distancematrix/json?units=metric&origins=${origin.lat},${origin.lng}&destinations=${destination.lat},${destination.lng}&key=${GOOGLE_MAPS_API_KEY}`;
@@ -219,7 +207,6 @@ async function getTravelTimeMinutes(origin, destination) {
     console.error("Error Matrix:", e.message);
   }
 
-  // fallback seguro
   return 20;
 }
 
@@ -313,22 +300,18 @@ async function isSlotFeasible(slotStart, newLocation, newDuration, rawBlock, exi
     duration: newDuration,
   };
 
-  // debe terminar dentro del bloque
   if (newAppt.end > blockEndTime) return false;
 
-  // Ordenar por hora
   const dailyRoute = [...existingAppointments, newAppt].sort((a, b) => a.start - b.start);
 
-  // 1) Solapes por tiempo (lo más importante)
   for (let i = 0; i < dailyRoute.length - 1; i++) {
     const current = dailyRoute[i];
     const next = dailyRoute[i + 1];
     if (current.end > next.start) return false;
   }
 
-  // 2) Simulación de viaje (con anti-zigzag)
   let currentLocation = HOME_ALGECIRAS;
-  let simulatedTime = setTime(dayBase, 8, 0); // sales 08:00
+  let simulatedTime = setTime(dayBase, 8, 0);
 
   for (let i = 0; i < dailyRoute.length; i++) {
     const appt = dailyRoute[i];
@@ -341,7 +324,6 @@ async function isSlotFeasible(slotStart, newLocation, newDuration, rawBlock, exi
 
     const arrivalTime = addMinutes(simulatedTime, travelMinutes + TRAVEL_MARGIN_MINUTES);
 
-    // si llegas tarde: fuera
     if (arrivalTime > appt.start) return false;
 
     simulatedTime = appt.end;
@@ -371,14 +353,12 @@ async function getServiceByToken(token) {
     zip: d.zip || "",
     name: d.clientName || "Cliente",
     phone: d.phone || d.phoneNumber || "",
-    // duracion robusta (si viene como string/num)
     duration: parseDurationMinutes(d.estimatedDuration ?? d.duration ?? d.realDuration ?? SERVICE_DEFAULT_MIN),
     originalDate,
   };
 }
 
 async function getAppointmentsForDay(dayBaseES, block) {
-  // rangos del día en hora Madrid
   const startES = spainDayStart(dayBaseES);
   const endES = addDays(startES, 1);
 
@@ -397,18 +377,15 @@ async function getAppointmentsForDay(dayBaseES, block) {
     const data = doc.data() || {};
     if (!data.date || typeof data.date.toDate !== "function") continue;
 
-    // ✅ convertir a “hora Madrid” para hour/minutes correctos
     const apptDateReal = data.date.toDate();
     const apptDateES = toSpainDate(apptDateReal);
 
-    // Filtrado por bloque real (mañana/tarde) según horario
     const hour = apptDateES.getHours();
     const isMorning = hour < 15;
 
     if (normalizeBlock(block) === "morning" && !isMorning) continue;
     if (normalizeBlock(block) === "afternoon" && isMorning) continue;
 
-    // ubicación
     let loc = HOME_ALGECIRAS;
     const addr = (data.address || "").trim();
     const city = (data.city || "").trim();
@@ -420,12 +397,10 @@ async function getAppointmentsForDay(dayBaseES, block) {
       } catch (_) {}
     }
 
-    // ✅ duración robusta
     const realDuration = parseDurationMinutes(
       data.duration ?? data.estimatedDuration ?? data.realDuration ?? SERVICE_DEFAULT_MIN
     );
 
-    // ✅ usar apptDateES para start/end (mismo “marco horario” que los slots)
     const start = apptDateES;
     const end = addMinutes(start, realDuration);
 
@@ -441,7 +416,6 @@ async function getAppointmentsForDay(dayBaseES, block) {
   return appts;
 }
 
-// =============== HELPER: CREAR CAMBIO DE CITA PARA LA APP ===============
 async function createChangeRequestForApp({ token, service, finalDate, startTime, endTime }) {
   const [h, m] = startTime.split(":").map((n) => parseInt(n, 10));
   const startHour = h;
@@ -477,16 +451,13 @@ async function createChangeRequestForApp({ token, service, finalDate, startTime,
     createdAt: admin.firestore.FieldValue.serverTimestamp(),
   };
 
-  // Colección que lee la app
   const changeRef = await db.collection("appointmentChangeRequests").add(docData);
-
-  // histórico opcional
   await db.collection("onlineAppointmentRequests").add(docData);
 
   return changeRef.id;
 }
 
-// =============== ADMIN AUTH (LOGIN) ===============
+// =============== ADMIN AUTH ===============
 function getBearerToken(req) {
   const h = req.headers.authorization || "";
   const parts = h.split(" ");
@@ -534,21 +505,16 @@ app.post("/admin/login", async (req, res) => {
   }
 });
 
-// =============== ADMIN: BLOQUEOS ===============
+// =============== ADMIN: BLOQUEOS (FIXED - SIN FILTROS FECHA) ===============
 app.get("/admin/blocks", requireAdmin, async (req, res) => {
   try {
-    const now = getSpainNow();
-    const to = addDays(now, 60);
-    const fromKey = toDayKeyES(now);
-    const toKey = toDayKeyES(to);
+    // MODIFICADO: Traemos los últimos 1000 sin filtrar por fecha "from/to"
+    const snap = await db.collection("calendarBlocks")
+      .orderBy("createdAt", "desc")
+      .limit(1000) 
+      .get();
 
-    const snap = await db.collection("calendarBlocks").orderBy("createdAt", "desc").limit(300).get();
-
-    const itemsRaw = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-    const items = itemsRaw.filter((it) => {
-      const keys = it.dayKeys || [];
-      return keys.some((k) => k >= fromKey && k <= toKey);
-    });
+    const items = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
 
     res.json({ ok: true, items });
   } catch (e) {
@@ -619,11 +585,9 @@ app.post("/availability-smart", async (req, res) => {
     const service = await getServiceByToken(token);
     if (!service) return res.status(404).json({ error: "Token inválido" });
 
-    // Geolocalizamos al NUEVO cliente
     const fullAddr = `${service.address}, ${service.city}, ${service.zip}`.trim();
     const clientLoc = await geocodeAddress(fullAddr);
 
-    // Duración del nuevo servicio
     const newServiceDuration = parseDurationMinutes(service.duration || SERVICE_DEFAULT_MIN);
 
     const resultDays = [];
@@ -633,14 +597,11 @@ app.post("/availability-smart", async (req, res) => {
       const dayCandidate = addDays(nowES, i);
       const dayBaseES = spainDayStart(dayCandidate);
 
-      // No findes
       if (isWeekendES(dayBaseES)) continue;
 
-      // ✅ Bloqueos del día (globales o por ciudad del servicio)
       const dayKey = toDayKeyES(dayBaseES);
       const blocks = await getBlocksForDay(dayKey, service.city || "");
 
-      // Si hay bloqueo día completo => saltar el día
       if (blocks.some((b) => b.allDay)) continue;
 
       const existingAppts = await getAppointmentsForDay(dayBaseES, block);
@@ -649,12 +610,10 @@ app.post("/availability-smart", async (req, res) => {
       const validSlots = [];
 
       for (const slotStart of possibleStartTimes) {
-        // ✅ No ofrecer horas pasadas de HOY
         if (slotStart < nowES) continue;
 
         const slotEnd = addMinutes(slotStart, newServiceDuration);
 
-        // ✅ Bloqueos horarios
         const blocked = blocks.some((b) => {
           if (!b.start || !b.end) return false;
           const bStart = toSpainDate(b.start);
@@ -663,7 +622,6 @@ app.post("/availability-smart", async (req, res) => {
         });
         if (blocked) continue;
 
-        // ✅ Validación anti-solapes + viaje + anti-zigzag
         const feasible = await isSlotFeasible(
           slotStart,
           clientLoc,
@@ -700,7 +658,6 @@ app.post("/availability-smart", async (req, res) => {
   }
 });
 
-// =============== CITAS: CREAR SOLICITUD (APP CAMBIO DE CITA) ===============
 app.post("/appointment-request", async (req, res) => {
   try {
     const { token, date, startTime, endTime } = req.body;
@@ -708,7 +665,6 @@ app.post("/appointment-request", async (req, res) => {
       return res.status(400).json({ error: "Datos faltantes" });
     }
 
-    // fecha en ES
     const [h, m] = startTime.split(":");
     const base = new Date(date);
     base.setHours(parseInt(h, 10), parseInt(m, 10), 0, 0);
@@ -731,7 +687,6 @@ app.post("/appointment-request", async (req, res) => {
   }
 });
 
-// Endpoint auxiliar para ver datos del cliente
 app.post("/client-from-token", async (req, res) => {
   try {
     const { token } = req.body;
