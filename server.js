@@ -1,4 +1,4 @@
-// server.js (V6 - FIX DEFINITIVO BLOQUEOS Y VISIBILIDAD)
+// server.js (V7 - CON RUTA DE CITA CORREGIDA)
 const express = require("express");
 const cors = require("cors");
 const admin = require("firebase-admin");
@@ -34,8 +34,6 @@ const SCHEDULE = {
 };
 const SLOT_INTERVAL = 30;
 const SERVICE_DEFAULT_MIN = 60;
-const TRAVEL_MARGIN_MINUTES = 15;
-const MAX_TRAVEL_ALLOWED_BETWEEN_JOBS = 30;
 
 const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY || "";
 const ADMIN_USER = process.env.ADMIN_USER || "";
@@ -45,14 +43,12 @@ const PORT = process.env.PORT || 10000;
 
 const app = express();
 app.use(cors({ origin: true }));
-app.use(express.json());
+app.use(express.json()); // <--- IMPORTANTE: Esto permite leer el JSON que envía el frontend
 
 const geocodeCache = new Map();
 const distanceCache = new Map();
 
 // =============== UTILIDADES ===============
-// "Simula" hora España creando un objeto Date con la hora local de Madrid
-// pero representada como UTC para facilitar cálculos matemáticos
 function toSpainDate(dateInput = new Date()) {
   const d = new Date(dateInput);
   const spainString = d.toLocaleString("en-US", { timeZone: "Europe/Madrid" });
@@ -81,7 +77,6 @@ function formatTime(date) {
   return `${h}:${m}`;
 }
 
-// Devuelve minutos desde medianoche (ej 17:00 -> 1020)
 function getMinutesFromMidnight(dateObj) {
   return dateObj.getHours() * 60 + dateObj.getMinutes();
 }
@@ -125,24 +120,6 @@ async function geocodeAddress(fullAddress) {
   } catch (e) { return HOME_ALGECIRAS; }
 }
 
-async function getTravelTimeMinutes(origin, destination) {
-  if (Math.abs(origin.lat - destination.lat) < 0.001 && Math.abs(origin.lng - destination.lng) < 0.001) return 0;
-  const k = `${origin.lat},${origin.lng}_${destination.lat},${destination.lng}`;
-  if (distanceCache.has(k)) return distanceCache.get(k);
-  if (!GOOGLE_MAPS_API_KEY) return 20;
-
-  try {
-    const r = await fetch(`https://maps.googleapis.com/maps/api/distancematrix/json?units=metric&origins=${origin.lat},${origin.lng}&destinations=${destination.lat},${destination.lng}&key=${GOOGLE_MAPS_API_KEY}`);
-    const d = await r.json();
-    if (d.status === "OK" && d.rows[0].elements[0].status === "OK") {
-      const min = Math.ceil(d.rows[0].elements[0].duration.value / 60);
-      distanceCache.set(k, min);
-      return min;
-    }
-  } catch (e) {}
-  return 20;
-}
-
 // =============== LÓGICA DE CITAS ===============
 function generateSlotsForDayAndBlock(dayBaseES, rawBlock) {
   const block = normalizeBlock(rawBlock);
@@ -165,7 +142,6 @@ function toDayKeyES(dateInput) {
   return `${y}-${m}-${da}`;
 }
 
-// Claves de día para indexación rápida
 function buildDayKeysBetween(startDate, endDate) {
   const keys = [];
   let curr = new Date(startDate); curr.setHours(0,0,0,0);
@@ -186,8 +162,6 @@ async function getBlocksForDay(dayKey, clientCity="") {
   
   return snap.docs.map(d => {
     const data = d.data();
-    // ⚠️ AQUÍ ESTÁ EL FIX: NO convertimos con toSpainDate, usamos la fecha tal cual se guardó
-    // para evitar doble desplazamiento horario
     return {
       id: d.id,
       start: data.start?.toDate ? data.start.toDate() : null,
@@ -212,7 +186,6 @@ app.post("/availability-smart", async (req, res) => {
     
     const sData = service.data();
     const duration = parseDurationMinutes(sData.duration);
-    const clientLoc = await geocodeAddress(`${sData.address}, ${sData.city}`);
     
     const nowES = getSpainNow();
     const resultDays = [];
@@ -226,12 +199,11 @@ app.post("/availability-smart", async (req, res) => {
       const dayKey = toDayKeyES(dayBase);
       const blocks = await getBlocksForDay(dayKey, sData.city);
 
-      if(blocks.some(b => b.allDay)) continue; // Día completo bloqueado
+      if(blocks.some(b => b.allDay)) continue;
 
       const possibleSlots = generateSlotsForDayAndBlock(dayBase, block);
       const valid = [];
 
-      // Traer citas existentes
       const dayStart = new Date(dayBase);
       const dayEnd = addDays(dayStart, 1);
       const apptsSnap = await db.collection("appointments")
@@ -245,7 +217,6 @@ app.post("/availability-smart", async (req, res) => {
         return {
            start: realStart,
            end: addMinutes(realStart, parseDurationMinutes(d.duration)),
-           location: null // (Simplificación: si ya hay cita, se comprueba solape)
         };
       });
 
@@ -256,11 +227,8 @@ app.post("/availability-smart", async (req, res) => {
         const sMinStart = getMinutesFromMidnight(sStart);
         const sMinEnd = getMinutesFromMidnight(sEnd);
 
-        // 🛡️ CHECK BLOQUEOS (MINUTO A MINUTO)
         const isBlocked = blocks.some(b => {
            if(!b.start || !b.end) return false;
-           // Truco: Usar getMinutesFromMidnight sobre el objeto Date tal cual viene de Firestore
-           // Asumiendo que se guardó correctamente.
            const bMinStart = getMinutesFromMidnight(b.start);
            const bMinEnd = getMinutesFromMidnight(b.end);
            return sMinStart < bMinEnd && sMinEnd > bMinStart;
@@ -268,11 +236,9 @@ app.post("/availability-smart", async (req, res) => {
 
         if(isBlocked) continue;
 
-        // 🛡️ CHECK SOLAPES CITAS
         const isOverlap = existing.some(ex => sStart < ex.end && sEnd > ex.start);
         if(isOverlap) continue;
 
-        // Si pasa filtros básicos, lo añadimos (saltamos geo compleja por ahora para testear bloqueos)
         valid.push({ startTime: formatTime(sStart), endTime: formatTime(sEnd) });
       }
 
@@ -291,18 +257,14 @@ app.post("/availability-smart", async (req, res) => {
   }
 });
 
-// 2. ADMIN: BLOQUEOS (GET) - FORMATEADO PARA FULLCALENDAR
+// 2. ADMIN: BLOQUEOS (GET)
 app.get("/admin/blocks", async (req, res) => {
-  // Sin auth para debug rápido si quieres, o añade requireAdmin
   try {
     const snap = await db.collection("calendarBlocks").orderBy("createdAt", "desc").limit(1000).get();
-    
-    // Devolvemos el formato ISO limpio para que el frontend no se líe
     const items = snap.docs.map(d => {
       const data = d.data();
       return {
         id: d.id,
-        // Convertimos a String ISO para que el JS del cliente lo entienda perfecto
         start: data.start?.toDate().toISOString(), 
         end: data.end?.toDate().toISOString(),
         allDay: data.allDay,
@@ -310,20 +272,16 @@ app.get("/admin/blocks", async (req, res) => {
         city: data.city
       };
     });
-    
     res.json({ ok: true, items });
   } catch(e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-// 3. ADMIN: BLOQUEOS (POST) - SIN TRUCOS DE FECHA
+// 3. ADMIN: BLOQUEOS (POST)
 app.post("/admin/blocks", async (req, res) => {
   try {
     const { startISO, endISO, allDay, reason, city } = req.body;
-    
-    // ⚠️ GUARDADO DIRECTO: Lo que envía el HTML es lo que se guarda.
-    // HTML envía: "2025-12-12T17:00". Node crea una fecha. Firestore la guarda.
     const s = new Date(startISO);
     const e = new Date(endISO);
     
@@ -367,10 +325,42 @@ app.post("/admin/login", (req, res) => {
   }
 });
 
+// 6. CLIENT INFO
 app.post("/client-from-token", async(req,res)=>{
   const d = await db.collection("appointments").doc(req.body.token).get();
   if(d.exists) res.json(d.data());
   else res.status(404).json({});
 });
 
-app.listen(PORT, () => console.log("✅ Marsalva V6 Running"));
+// =========================================================
+// 7. 🔥 ESTA ES LA RUTA QUE FALTABA (SOLICITUD DE CITA) 🔥
+// =========================================================
+app.post("/appointment-request", async (req, res) => {
+  try {
+    console.log("📩 Solicitud recibida:", req.body);
+    const { token, date, startTime, endTime } = req.body;
+
+    if (!token || !date || !startTime) {
+      return res.status(400).json({ error: "Datos incompletos" });
+    }
+
+    // Actualizamos la cita en Firebase con el horario seleccionado
+    // Cambiamos el estado a 'pending_approval' (o el que uses)
+    await db.collection("appointments").doc(token).update({
+      dateStr: date,              // Fecha en texto (ej: 2025-05-10)
+      startTime: startTime,       // Hora inicio (ej: 09:30)
+      endTime: endTime,           // Hora fin (ej: 10:30)
+      status: "pending_approval", // Para que sepa el admin que hay que revisar
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    console.log(`✅ Cita actualizada para token ${token}: ${date} ${startTime}`);
+    res.json({ success: true, message: "Cita guardada correctamente" });
+
+  } catch (error) {
+    console.error("❌ Error guardando cita:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.listen(PORT, () => console.log("✅ Marsalva V7 Running"));
