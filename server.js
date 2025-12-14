@@ -1,10 +1,10 @@
-// server.js (V9 - ESTRUCTURA EXACTA DATABASE)
+// server.js (V10 - VERSIÓN FINAL INTEGRADA)
 const express = require("express");
 const cors = require("cors");
 const admin = require("firebase-admin");
 const jwt = require("jsonwebtoken");
 
-// =============== INICIALIZACIÓN ===============
+// =============== 1. INICIALIZACIÓN FIREBASE ===============
 if (!admin.apps.length) {
   const projectId = process.env.FIREBASE_PROJECT_ID;
   const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
@@ -26,7 +26,7 @@ if (!admin.apps.length) {
 
 const db = admin.firestore();
 
-// =============== CONFIGURACIÓN ===============
+// =============== 2. CONFIGURACIÓN GLOBAL ===============
 const HOME_ALGECIRAS = { lat: 36.1408, lng: -5.4562 };
 const SCHEDULE = {
   morning: { startHour: 9, startMinute: 30, endHour: 14, endMinute: 0 },
@@ -36,9 +36,7 @@ const SLOT_INTERVAL = 30;
 const SERVICE_DEFAULT_MIN = 60;
 
 const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY || "";
-const ADMIN_USER = process.env.ADMIN_USER || "";
-const ADMIN_PASS = process.env.ADMIN_PASS || "";
-const ADMIN_JWT_SECRET = process.env.ADMIN_JWT_SECRET || "";
+const ADMIN_JWT_SECRET = process.env.ADMIN_JWT_SECRET || "secreto_super_seguro"; // Cambiar en prod
 const PORT = process.env.PORT || 10000;
 
 const app = express();
@@ -46,9 +44,22 @@ app.use(cors({ origin: true }));
 app.use(express.json());
 
 const geocodeCache = new Map();
-const distanceCache = new Map();
 
-// =============== UTILIDADES ===============
+// =============== 3. MIDDLEWARE DE SEGURIDAD ===============
+const verifyAdmin = (req, res, next) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader) return res.status(401).json({ error: "No token provided" });
+
+  const token = authHeader.split(" ")[1];
+  try {
+    jwt.verify(token, ADMIN_JWT_SECRET);
+    next();
+  } catch (err) {
+    return res.status(403).json({ error: "Token inválido o expirado" });
+  }
+};
+
+// =============== 4. UTILIDADES (FECHAS Y MAPAS) ===============
 function toSpainDate(dateInput = new Date()) {
   const d = new Date(dateInput);
   const spainString = d.toLocaleString("en-US", { timeZone: "Europe/Madrid" });
@@ -104,7 +115,6 @@ function parseDurationMinutes(value) {
   return parseInt(s) || SERVICE_DEFAULT_MIN;
 }
 
-// =============== GOOGLE MAPS ===============
 async function geocodeAddress(fullAddress) {
   if (!fullAddress) throw new Error("Dir vacía");
   if (geocodeCache.has(fullAddress)) return geocodeCache.get(fullAddress);
@@ -120,7 +130,6 @@ async function geocodeAddress(fullAddress) {
   } catch (e) { return HOME_ALGECIRAS; }
 }
 
-// =============== LÓGICA DE CITAS ===============
 function generateSlotsForDayAndBlock(dayBaseES, rawBlock) {
   const block = normalizeBlock(rawBlock);
   const config = SCHEDULE[block];
@@ -170,14 +179,157 @@ async function getBlocksForDay(dayKey, clientCity="") {
       city: (data.city || "").trim().toLowerCase()
     };
   }).filter(b => {
-    if (!b.city) return true; // global
+    if (!b.city) return true; 
     return b.city === cityNorm;
   });
 }
 
-// =============== ENDPOINTS ===============
 
-// 1. Availability Smart
+// =============== 5. ENDPOINTS DE AUTENTICACIÓN ===============
+
+// A) LOGIN INTELIGENTE (Firebase > Env Vars)
+app.post("/admin/login", async (req, res) => {
+  const { user, pass } = req.body;
+  try {
+    // 1. Buscamos credenciales personalizadas en DB
+    const doc = await db.collection("settings").doc("admin_access").get();
+    
+    // Valores por defecto (del sistema)
+    let validUser = process.env.ADMIN_USER || "admin";
+    let validPass = process.env.ADMIN_PASS || "admin";
+
+    // Si existen en DB, sobrescriben a las del sistema
+    if (doc.exists) {
+        const data = doc.data();
+        if (data.user && data.pass) {
+            validUser = data.user;
+            validPass = data.pass;
+        }
+    }
+
+    if(user === validUser && pass === validPass) {
+       // Token válido por 30 días
+       const token = jwt.sign({role:"admin"}, ADMIN_JWT_SECRET, { expiresIn: '30d' });
+       res.json({ok:true, token});
+    } else {
+       res.status(401).json({error:"Credenciales incorrectas"});
+    }
+  } catch(e) {
+    console.error(e);
+    res.status(500).json({error: "Error interno verificando credenciales"});
+  }
+});
+
+// B) CAMBIAR CREDENCIALES ROOT (Protegido)
+app.post("/admin/update-root-access", verifyAdmin, async (req, res) => {
+    try {
+        const { newUser, newPass } = req.body;
+        if (!newUser || !newPass) return res.status(400).json({error: "Faltan datos"});
+
+        await db.collection("settings").doc("admin_access").set({
+            user: newUser,
+            pass: newPass,
+            updatedAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+
+        res.json({ success: true, message: "Credenciales actualizadas." });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+
+// =============== 6. ENDPOINTS CONFIGURACIÓN HOMESERVE ===============
+
+// GET CONFIG
+app.get("/admin/config/homeserve", verifyAdmin, async (req, res) => {
+  try {
+    const doc = await db.collection("settings").doc("homeserve").get();
+    if (!doc.exists) return res.json({ user: "", hasPass: false, lastChange: null });
+    
+    const data = doc.data();
+    res.json({
+      user: data.user,
+      hasPass: !!data.pass, // Solo decimos si existe, no la devolvemos
+      lastChange: data.lastChange ? data.lastChange.toDate().toISOString() : null
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// SAVE CONFIG
+app.post("/admin/config/homeserve", verifyAdmin, async (req, res) => {
+  try {
+    const { user, pass } = req.body;
+    await db.collection("settings").doc("homeserve").set({
+      user,
+      pass,
+      lastChange: admin.firestore.FieldValue.serverTimestamp()
+    }, { merge: true });
+
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET SERVICES
+app.get("/admin/services/homeserve", verifyAdmin, async (req, res) => {
+  try {
+    const snapshot = await db.collection("externalServices").where("provider", "==", "homeserve").get();
+    
+    // Si está vacío, creamos dummy data para que no se vea feo al principio
+    if (snapshot.empty) {
+        const dummies = [
+            { provider: 'homeserve', client: 'Cliente Ejemplo 1', address: 'Calle Prueba, 1', status: 'pending' }
+        ];
+        for(const d of dummies) await db.collection("externalServices").add(d);
+        const snap2 = await db.collection("externalServices").where("provider", "==", "homeserve").get();
+        return res.json(snap2.docs.map(d => ({ id: d.id, ...d.data() })));
+    }
+
+    const services = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
+    res.json(services);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// EDIT SERVICE
+app.put("/admin/services/homeserve/:id", verifyAdmin, async (req, res) => {
+  try {
+    const { client, address } = req.body;
+    await db.collection("externalServices").doc(req.params.id).update({ client, address });
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// DELETE SERVICES
+app.post("/admin/services/homeserve/delete", verifyAdmin, async (req, res) => {
+  try {
+    const { ids } = req.body; 
+    if(!ids || !ids.length) return res.status(400).json({error: "No IDs"});
+
+    const batch = db.batch();
+    ids.forEach(id => {
+        const ref = db.collection("externalServices").doc(id);
+        batch.delete(ref);
+    });
+    await batch.commit();
+    
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+
+// =============== 7. ENDPOINTS LÓGICA DE NEGOCIO (CITAS) ===============
+
+// AVAILABILITY SMART
 app.post("/availability-smart", async (req, res) => {
   try {
     const { token, block, rangeDays } = req.body;
@@ -192,7 +344,7 @@ app.post("/availability-smart", async (req, res) => {
 
     for(let i=0; i<(rangeDays||14); i++) {
       const day = addDays(nowES, i);
-      const dayBase = setTime(day, 0, 0); // 00:00 del día
+      const dayBase = setTime(day, 0, 0); 
       
       if(isWeekendES(dayBase)) continue;
 
@@ -257,7 +409,65 @@ app.post("/availability-smart", async (req, res) => {
   }
 });
 
-// 2. ADMIN: BLOQUEOS (GET)
+// SOLICITUD DE CITA (Guarda en Pendientes)
+app.post("/appointment-request", async (req, res) => {
+  try {
+    console.log("📩 Nueva solicitud pendiente:", req.body);
+    const { token, date, startTime, endTime, block } = req.body;
+
+    if (!token || !date || !startTime) {
+      return res.status(400).json({ error: "Datos incompletos" });
+    }
+
+    // 1. Buscamos cita original
+    const originalRef = db.collection("appointments").doc(token);
+    const originalSnap = await originalRef.get();
+
+    if (!originalSnap.exists) {
+      return res.status(404).json({ error: "Cita original no encontrada" });
+    }
+    const originalData = originalSnap.data();
+
+    // 2. Construir el Timestamp solicitado
+    const [year, month, day] = date.split('-').map(Number);
+    const [hour, minute] = startTime.split(':').map(Number);
+    const reqDateObj = new Date(year, month - 1, day, hour, minute);
+
+    // 3. Crear el documento CON LA ESTRUCTURA EXACTA QUE PIDE TU APP
+    const requestData = {
+      address: originalData.address || "",
+      appointmentId: token,
+      city: originalData.city || "",
+      clientName: originalData.clientName || originalData.name || "Cliente",
+      clientPhone: originalData.phone || originalData.clientPhone || "",
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      
+      originalDate: originalData.date || null,
+      
+      requestedBlock: block || "unknown",
+      requestedDate: admin.firestore.Timestamp.fromDate(reqDateObj),
+      requestedDateString: date,
+      requestedEndTime: endTime,
+      requestedStartTime: startTime,
+      
+      source: "smartBooking",
+      status: "pending",
+      token: token,
+      zip: originalData.zip || originalData.cp || ""
+    };
+
+    await db.collection("onlineAppointmentRequests").add(requestData);
+
+    console.log(`✅ Solicitud guardada para ${requestData.clientName}`);
+    res.json({ success: true, message: "Solicitud enviada a revisión correctamente" });
+
+  } catch (error) {
+    console.error("❌ Error guardando solicitud:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ADMIN: BLOQUEOS (GET)
 app.get("/admin/blocks", async (req, res) => {
   try {
     const snap = await db.collection("calendarBlocks").orderBy("createdAt", "desc").limit(1000).get();
@@ -278,7 +488,7 @@ app.get("/admin/blocks", async (req, res) => {
   }
 });
 
-// 3. ADMIN: BLOQUEOS (POST)
+// ADMIN: BLOQUEOS (POST)
 app.post("/admin/blocks", async (req, res) => {
   try {
     const { startISO, endISO, allDay, reason, city } = req.body;
@@ -289,7 +499,6 @@ app.post("/admin/blocks", async (req, res) => {
        s.setHours(0,0,0,0);
        e.setHours(23,59,59,999);
     }
-
     const dayKeys = buildDayKeysBetween(s, e);
     
     await db.collection("calendarBlocks").add({
@@ -301,98 +510,23 @@ app.post("/admin/blocks", async (req, res) => {
       dayKeys,
       createdAt: admin.firestore.FieldValue.serverTimestamp()
     });
-    
     res.json({ ok: true });
   } catch(e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-// 4. ADMIN: DELETE
+// ADMIN: DELETE BLOCK
 app.delete("/admin/blocks/:id", async (req, res) => {
   await db.collection("calendarBlocks").doc(req.params.id).delete();
   res.json({ ok: true });
 });
 
-// 5. LOGIN
-app.post("/admin/login", (req, res) => {
-  const { user, pass } = req.body;
-  if(user === ADMIN_USER && pass === ADMIN_PASS) {
-     const token = jwt.sign({role:"admin"}, ADMIN_JWT_SECRET);
-     res.json({ok:true, token});
-  } else {
-     res.status(401).json({error:"Error credenciales"});
-  }
-});
-
-// 6. CLIENT INFO
+// CLIENT INFO
 app.post("/client-from-token", async(req,res)=>{
   const d = await db.collection("appointments").doc(req.body.token).get();
   if(d.exists) res.json(d.data());
   else res.status(404).json({});
 });
 
-// =========================================================
-// 7. 🔥 SOLICITUD DE CITA -> onlineAppointmentRequests (CORREGIDO) 🔥
-// =========================================================
-app.post("/appointment-request", async (req, res) => {
-  try {
-    console.log("📩 Nueva solicitud pendiente:", req.body);
-    const { token, date, startTime, endTime, block } = req.body;
-
-    if (!token || !date || !startTime) {
-      return res.status(400).json({ error: "Datos incompletos" });
-    }
-
-    // 1. Buscamos la cita original
-    const originalRef = db.collection("appointments").doc(token);
-    const originalSnap = await originalRef.get();
-
-    if (!originalSnap.exists) {
-      return res.status(404).json({ error: "Cita original no encontrada" });
-    }
-    const originalData = originalSnap.data();
-
-    // 2. Construir el Timestamp solicitado
-    // El frontend envía "YYYY-MM-DD" y "HH:MM". Creamos un objeto Date.
-    const [year, month, day] = date.split('-').map(Number);
-    const [hour, minute] = startTime.split(':').map(Number);
-    // Nota: Month en JS empieza en 0
-    const reqDateObj = new Date(year, month - 1, day, hour, minute);
-
-    // 3. Crear el documento CON LA ESTRUCTURA EXACTA QUE PIDE TU APP
-    const requestData = {
-      address: originalData.address || "",
-      appointmentId: token,  // Tu app usa este nombre
-      city: originalData.city || "",
-      clientName: originalData.clientName || originalData.name || "Cliente",
-      clientPhone: originalData.phone || originalData.clientPhone || "",
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      
-      originalDate: originalData.date || null, // Importante para que tu app sepa cuándo era antes
-      
-      requestedBlock: block || "unknown",
-      requestedDate: admin.firestore.Timestamp.fromDate(reqDateObj), // Timestamp real
-      requestedDateString: date, // String "2025-12-24"
-      requestedEndTime: endTime,
-      requestedStartTime: startTime,
-      
-      source: "smartBooking",
-      status: "pending",
-      token: token, // Duplicado porque a veces tu app busca uno u otro
-      zip: originalData.zip || originalData.cp || ""
-    };
-
-    await db.collection("onlineAppointmentRequests").add(requestData);
-
-    console.log(`✅ Solicitud guardada perfectamente para ${requestData.clientName}`);
-    
-    res.json({ success: true, message: "Solicitud enviada a revisión correctamente" });
-
-  } catch (error) {
-    console.error("❌ Error guardando solicitud:", error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-app.listen(PORT, () => console.log("✅ Marsalva V9 (Estructura Correcta) Running"));
+app.listen(PORT, () => console.log(`✅ Marsalva Server V10 Running on Port ${PORT}`));
