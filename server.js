@@ -1,4 +1,4 @@
-// server.js (V7 - CON RUTA DE CITA CORREGIDA)
+// server.js (V8 - FINAL: SOLICITUDES A REVISIÓN)
 const express = require("express");
 const cors = require("cors");
 const admin = require("firebase-admin");
@@ -43,7 +43,7 @@ const PORT = process.env.PORT || 10000;
 
 const app = express();
 app.use(cors({ origin: true }));
-app.use(express.json()); // <--- IMPORTANTE: Esto permite leer el JSON que envía el frontend
+app.use(express.json()); // Necesario para leer los datos que envía el frontend
 
 const geocodeCache = new Map();
 const distanceCache = new Map();
@@ -333,34 +333,51 @@ app.post("/client-from-token", async(req,res)=>{
 });
 
 // =========================================================
-// 7. 🔥 ESTA ES LA RUTA QUE FALTABA (SOLICITUD DE CITA) 🔥
+// 7. 🔥 SOLICITUD DE CITA -> onlineAppointmentRequests 🔥
 // =========================================================
 app.post("/appointment-request", async (req, res) => {
   try {
-    console.log("📩 Solicitud recibida:", req.body);
-    const { token, date, startTime, endTime } = req.body;
+    console.log("📩 Nueva solicitud pendiente:", req.body);
+    const { token, date, startTime, endTime, block } = req.body;
 
     if (!token || !date || !startTime) {
       return res.status(400).json({ error: "Datos incompletos" });
     }
 
-    // Actualizamos la cita en Firebase con el horario seleccionado
-    // Cambiamos el estado a 'pending_approval' (o el que uses)
-    await db.collection("appointments").doc(token).update({
-      dateStr: date,              // Fecha en texto (ej: 2025-05-10)
-      startTime: startTime,       // Hora inicio (ej: 09:30)
-      endTime: endTime,           // Hora fin (ej: 10:30)
-      status: "pending_approval", // Para que sepa el admin que hay que revisar
-      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    // 1. Buscamos la cita original SOLO para obtener los datos del cliente
+    // (No modificamos la colección appointments)
+    const originalRef = db.collection("appointments").doc(token);
+    const originalSnap = await originalRef.get();
+
+    if (!originalSnap.exists) {
+      return res.status(404).json({ error: "Cita original no encontrada" });
+    }
+    const originalData = originalSnap.data();
+
+    // 2. Creamos un NUEVO documento en la colección de solicitudes pendientes
+    await db.collection("onlineAppointmentRequests").add({
+      originalAppointmentId: token, // Enlace para saber a qué cita corresponde
+      clientName: originalData.clientName || originalData.name || "Cliente",
+      city: originalData.city || "",
+      
+      // Lo que pide el cliente
+      requestedDate: date,       // "2025-XX-XX"
+      requestedStartTime: startTime,
+      requestedEndTime: endTime,
+      requestedBlock: block || "Desconocido",
+      
+      status: "pending",         // Estado inicial
+      createdAt: admin.firestore.FieldValue.serverTimestamp()
     });
 
-    console.log(`✅ Cita actualizada para token ${token}: ${date} ${startTime}`);
-    res.json({ success: true, message: "Cita guardada correctamente" });
+    console.log(`✅ Solicitud creada en 'onlineAppointmentRequests' para ${originalData.clientName}`);
+    
+    res.json({ success: true, message: "Solicitud enviada a revisión correctamente" });
 
   } catch (error) {
-    console.error("❌ Error guardando cita:", error);
+    console.error("❌ Error guardando solicitud:", error);
     res.status(500).json({ error: error.message });
   }
 });
 
-app.listen(PORT, () => console.log("✅ Marsalva V7 Running"));
+app.listen(PORT, () => console.log("✅ Marsalva V8 Running"));
