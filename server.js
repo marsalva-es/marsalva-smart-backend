@@ -1,4 +1,4 @@
-// server.js (V8 - FINAL: SOLICITUDES A REVISIÓN)
+// server.js (V9 - ESTRUCTURA EXACTA DATABASE)
 const express = require("express");
 const cors = require("cors");
 const admin = require("firebase-admin");
@@ -43,7 +43,7 @@ const PORT = process.env.PORT || 10000;
 
 const app = express();
 app.use(cors({ origin: true }));
-app.use(express.json()); // Necesario para leer los datos que envía el frontend
+app.use(express.json());
 
 const geocodeCache = new Map();
 const distanceCache = new Map();
@@ -333,7 +333,7 @@ app.post("/client-from-token", async(req,res)=>{
 });
 
 // =========================================================
-// 7. 🔥 SOLICITUD DE CITA -> onlineAppointmentRequests 🔥
+// 7. 🔥 SOLICITUD DE CITA -> onlineAppointmentRequests (CORREGIDO) 🔥
 // =========================================================
 app.post("/appointment-request", async (req, res) => {
   try {
@@ -344,8 +344,7 @@ app.post("/appointment-request", async (req, res) => {
       return res.status(400).json({ error: "Datos incompletos" });
     }
 
-    // 1. Buscamos la cita original SOLO para obtener los datos del cliente
-    // (No modificamos la colección appointments)
+    // 1. Buscamos la cita original
     const originalRef = db.collection("appointments").doc(token);
     const originalSnap = await originalRef.get();
 
@@ -354,23 +353,39 @@ app.post("/appointment-request", async (req, res) => {
     }
     const originalData = originalSnap.data();
 
-    // 2. Creamos un NUEVO documento en la colección de solicitudes pendientes
-    await db.collection("onlineAppointmentRequests").add({
-      originalAppointmentId: token, // Enlace para saber a qué cita corresponde
-      clientName: originalData.clientName || originalData.name || "Cliente",
-      city: originalData.city || "",
-      
-      // Lo que pide el cliente
-      requestedDate: date,       // "2025-XX-XX"
-      requestedStartTime: startTime,
-      requestedEndTime: endTime,
-      requestedBlock: block || "Desconocido",
-      
-      status: "pending",         // Estado inicial
-      createdAt: admin.firestore.FieldValue.serverTimestamp()
-    });
+    // 2. Construir el Timestamp solicitado
+    // El frontend envía "YYYY-MM-DD" y "HH:MM". Creamos un objeto Date.
+    const [year, month, day] = date.split('-').map(Number);
+    const [hour, minute] = startTime.split(':').map(Number);
+    // Nota: Month en JS empieza en 0
+    const reqDateObj = new Date(year, month - 1, day, hour, minute);
 
-    console.log(`✅ Solicitud creada en 'onlineAppointmentRequests' para ${originalData.clientName}`);
+    // 3. Crear el documento CON LA ESTRUCTURA EXACTA QUE PIDE TU APP
+    const requestData = {
+      address: originalData.address || "",
+      appointmentId: token,  // Tu app usa este nombre
+      city: originalData.city || "",
+      clientName: originalData.clientName || originalData.name || "Cliente",
+      clientPhone: originalData.phone || originalData.clientPhone || "",
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      
+      originalDate: originalData.date || null, // Importante para que tu app sepa cuándo era antes
+      
+      requestedBlock: block || "unknown",
+      requestedDate: admin.firestore.Timestamp.fromDate(reqDateObj), // Timestamp real
+      requestedDateString: date, // String "2025-12-24"
+      requestedEndTime: endTime,
+      requestedStartTime: startTime,
+      
+      source: "smartBooking",
+      status: "pending",
+      token: token, // Duplicado porque a veces tu app busca uno u otro
+      zip: originalData.zip || originalData.cp || ""
+    };
+
+    await db.collection("onlineAppointmentRequests").add(requestData);
+
+    console.log(`✅ Solicitud guardada perfectamente para ${requestData.clientName}`);
     
     res.json({ success: true, message: "Solicitud enviada a revisión correctamente" });
 
@@ -380,4 +395,4 @@ app.post("/appointment-request", async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log("✅ Marsalva V8 Running"));
+app.listen(PORT, () => console.log("✅ Marsalva V9 (Estructura Correcta) Running"));
