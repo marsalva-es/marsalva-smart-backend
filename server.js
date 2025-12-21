@@ -1,9 +1,9 @@
-// server.js (V12 - SMART CLUSTERING & TIME WINDOWS)
+// server.js (V13 - STRICT TIME WINDOWS & GEO CLUSTERING)
 const express = require("express");
 const cors = require("cors");
 const admin = require("firebase-admin");
 
-// =============== 1. INICIALIZACIÓN (IGUAL) ===============
+// =============== 1. INICIALIZACIÓN ===============
 if (!admin.apps.length) {
   const projectId = process.env.FIREBASE_PROJECT_ID;
   const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
@@ -30,7 +30,7 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 10000;
 
-// =============== 2. SEGURIDAD (IGUAL) ===============
+// =============== 2. SEGURIDAD (MIDDLEWARE) ===============
 const verifyFirebaseUser = async (req, res, next) => {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -47,23 +47,23 @@ const verifyFirebaseUser = async (req, res, next) => {
   }
 };
 
-// =============== 3. CONFIGURACIÓN y UTILS (ACTUALIZADO) ===============
-// AUMENTADO: Distancia máxima para agrupar citas (en KM)
+// =============== 3. CONFIGURACIÓN y UTILS ===============
+// Regla: No desplazarse más de 5km de una visita a otra en el mismo día
 const MAX_DISTANCE_KM = 5; 
 
+// Horario: Franjas enteras
 const SCHEDULE = {
-  morning: { startHour: 9, endHour: 14 },   // Simplificado para franjas enteras
-  afternoon: { startHour: 16, endHour: 20 }, // 16 a 20 (4 a 8 PM)
+  morning: { startHour: 9, endHour: 14 },    // Genera: 9-10, 10-11, ... 13-14
+  afternoon: { startHour: 16, endHour: 20 }, // Genera: 16-17, ... 19-20
 };
 
-// Utiles de fecha (Mantenemos los tuyos y añadimos cálculo de distancia)
 function toSpainDate(d=new Date()){return new Date(new Date(d).toLocaleString("en-US",{timeZone:"Europe/Madrid"}));}
 function getSpainNow(){return toSpainDate(new Date());}
 function addDays(d,days){return new Date(d.getTime() + days * 86400000);}
 
-// Fórmula de Haversine para calcular distancia en KM entre dos coordenadas
+// Fórmula Haversine (Cálculo preciso de distancia en KM)
 function getDistanceInKm(lat1, lon1, lat2, lon2) {
-  const R = 6371; // Radio de la tierra en km
+  const R = 6371; // Radio Tierra km
   const dLat = (lat2 - lat1) * (Math.PI/180);
   const dLon = (lon2 - lon1) * (Math.PI/180);
   const a = 
@@ -73,13 +73,13 @@ function getDistanceInKm(lat1, lon1, lat2, lon2) {
   return R * c;
 }
 
-// Verifica si dos rangos de tiempo se solapan
+// Verifica superposición de rangos de tiempo
 function isOverlapping(startA, endA, startB, endB) {
   return startA < endB && startB < endA;
 }
 
-// =============== 4. ENDPOINTS PROTEGIDOS (IGUAL) ===============
-// (Tus endpoints de admin se mantienen idénticos, no toco nada aquí)
+// =============== 4. ENDPOINTS PROTEGIDOS (ADMIN) ===============
+// (Sin cambios, manteniendo tu lógica funcional)
 
 app.get("/admin/config/homeserve", verifyFirebaseUser, async (req, res) => {
   try {
@@ -112,26 +112,25 @@ app.get("/admin/services/homeserve", verifyFirebaseUser, async (req, res) => {
     res.json(services);
 });
 
-// ... (Resto de endpoints admin se asumen presentes) ...
-
-// =============== 5. LÓGICA DE CITAS MEJORADA (AQUÍ ESTÁ EL CAMBIO) ===============
+// =============== 5. LÓGICA DE CITAS INTELIGENTE (OPTIMIZADA V13) ===============
 
 app.post("/availability-smart", async (req, res) => {
   try {
-    const { lat, lng, durationMinutes = 60 } = req.body; // Duración por defecto 60 min
+    // Recibimos lat/lng y la DURACIÓN real del servicio (default 60 min)
+    const { lat, lng, durationMinutes = 60 } = req.body;
 
     if (!lat || !lng) return res.status(400).json({ error: "Faltan coordenadas" });
 
-    // 1. Definir rango de búsqueda (ej: próximos 7 días)
     const today = getSpainNow();
-    const daysToCheck = 10;
+    const daysToCheck = 10; // Miramos los próximos 10 días
     let availableSlots = [];
 
-    // 2. Traer TODAS las citas futuras de la base de datos para comparar
+    // 1. Obtener rango de fechas
     const startRange = new Date(today);
     startRange.setHours(0,0,0,0);
     const endRange = addDays(startRange, daysToCheck);
     
+    // 2. Cargar TODAS las citas existentes en ese rango
     const snapshot = await db.collection("appointments")
       .where("date", ">=", startRange)
       .where("date", "<=", endRange)
@@ -139,24 +138,26 @@ app.post("/availability-smart", async (req, res) => {
 
     const existingApps = snapshot.docs.map(doc => {
       const data = doc.data();
+      // Calculamos el fin de la cita existente basándonos en SU duración
+      const appDuration = data.duration || 60;
       return {
-        start: data.date.toDate(), // Convertir timestamp a JS Date
-        end: new Date(data.date.toDate().getTime() + (data.duration || 60) * 60000),
+        start: data.date.toDate(),
+        end: new Date(data.date.toDate().getTime() + appDuration * 60000),
         lat: data.location?.lat,
         lng: data.location?.lng
       };
     });
 
-    // 3. Iterar por cada día
+    // 3. Procesar día a día
     for (let i = 0; i < daysToCheck; i++) {
       const currentDay = addDays(today, i);
       
-      // Saltamos domingos (0) o sábados (6) si no trabajas findes
+      // Excluir fines de semana (Sáb y Dom)
       const dayNum = currentDay.getDay();
       if (dayNum === 0 || dayNum === 6) continue; 
 
-      // === FILTRO GEOGRÁFICO (La Regla de los 5km) ===
-      // Buscamos si hay citas YA agendadas para este día
+      // === REGLA 1: CLUSTERING (Agrupación por Localidad) ===
+      // Filtramos citas que ya existen en ESTE día
       const dayApps = existingApps.filter(app => 
         app.start.getDate() === currentDay.getDate() &&
         app.start.getMonth() === currentDay.getMonth()
@@ -164,82 +165,83 @@ app.post("/availability-smart", async (req, res) => {
 
       let dayIsBlockedByDistance = false;
 
-      // Si hay citas, comprobamos si la NUEVA dirección está cerca de las EXISTENTES
-      // Si está lejos (> 5km) de CUALQUIERA de las citas del día, bloqueamos el día entero
-      // para forzar agrupación por localidad.
+      // Si hoy ya hay trabajo, verificamos que NO esté lejos (> 5km)
       if (dayApps.length > 0) {
         for (const bookedApp of dayApps) {
           if (bookedApp.lat && bookedApp.lng) {
             const dist = getDistanceInKm(lat, lng, bookedApp.lat, bookedApp.lng);
             if (dist > MAX_DISTANCE_KM) {
+              // Si hay AL MENOS UNA cita lejos, este día queda descartado.
+              // Esto fuerza a buscar un día vacío o un día con citas cerca.
               dayIsBlockedByDistance = true;
-              break; // Ya encontramos una lejos, este día no sirve para la nueva zona
+              break; 
             }
           }
         }
       }
 
-      if (dayIsBlockedByDistance) continue; // Saltamos al siguiente día
+      if (dayIsBlockedByDistance) continue; // Día descartado, siguiente.
 
-      // === GENERACIÓN DE FRANJAS HORARIAS (9-10, 10-11...) ===
-      // Definimos bloques: Mañana y Tarde
+      // === REGLA 2: FRANJAS HORARIAS & DURACIÓN ===
       const blocks = [SCHEDULE.morning, SCHEDULE.afternoon];
 
       for (const block of blocks) {
-        // Iteramos hora a hora dentro del bloque
+        // Bucle hora a hora: 9, 10, 11...
         for (let hour = block.startHour; hour < block.endHour; hour++) {
           
-          // Construimos la ventana propuesta: Ej 09:00 a 10:00
+          // Definimos el inicio de la franja (ej: 09:00)
           const slotStart = new Date(currentDay);
           slotStart.setHours(hour, 0, 0, 0);
           
-          const slotEnd = new Date(currentDay);
-          slotEnd.setHours(hour + 1, 0, 0, 0); // Ventanas de 1 hora fija
-          
-          // Verificamos que la ventana no haya pasado ya (si es hoy)
+          // Definimos el FINAL de la franja VISUAL (ej: 10:00) para mostrar al cliente
+          const windowEnd = new Date(currentDay);
+          windowEnd.setHours(hour + 1, 0, 0, 0);
+
+          // Definimos el FINAL REAL DE TRABAJO para comprobar hueco (Inicio + Duración Servicio)
+          // Esto es clave: si el servicio dura 2h, comprobamos si hay hueco de 9 a 11.
+          const workEnd = new Date(slotStart.getTime() + durationMinutes * 60000);
+
+          // Validación básica: no ofrecer horas pasadas
           if (slotStart < new Date()) continue;
 
-          // Verificamos colisiones con citas existentes
+          // Validación de colisión estricta
           let isOccupied = false;
           for (const booked of dayApps) {
-            // Si hay solape entre la ventana propuesta y una cita real
-            if (isOverlapping(slotStart, slotEnd, booked.start, booked.end)) {
+            // Comprobamos si el TRABAJO propuesto choca con citas existentes
+            if (isOverlapping(slotStart, workEnd, booked.start, booked.end)) {
               isOccupied = true;
               break;
             }
           }
 
           if (!isOccupied) {
-            // Formatear respuesta amigable
             const startStr = slotStart.toLocaleTimeString("es-ES", { hour: '2-digit', minute: '2-digit' });
-            const endStr = slotEnd.toLocaleTimeString("es-ES", { hour: '2-digit', minute: '2-digit' });
+            const endStr = windowEnd.toLocaleTimeString("es-ES", { hour: '2-digit', minute: '2-digit' });
             
-            // Texto para el frontend: "09:00 - 10:00"
+            // Textos amigables
             const label = `${startStr} - ${endStr}`;
             const message = `La visita se realizará entre las ${startStr} y las ${endStr}`;
 
             availableSlots.push({
-              date: slotStart.toISOString().split('T')[0], // YYYY-MM-DD
+              date: slotStart.toISOString().split('T')[0],
               startTime: startStr,
               endTime: endStr,
               label: label,
               message: message,
-              isoStart: slotStart.toISOString() // Para guardar en DB
+              isoStart: slotStart.toISOString() 
             });
           }
         }
       }
     }
 
-    // Agrupamos por día para enviar al frontend
-    // Estructura: { "2023-10-25": [ {label...}, {label...} ] }
+    // Agrupar respuesta
     const grouped = availableSlots.reduce((acc, slot) => {
       if (!acc[slot.date]) acc[slot.date] = [];
       acc[slot.date].push(slot);
       return acc;
     }, {});
 
-    // Convertimos a array para el frontend
     const responseArray = Object.keys(grouped).map(dateKey => ({
       date: dateKey,
       slots: grouped[dateKey]
@@ -253,18 +255,16 @@ app.post("/availability-smart", async (req, res) => {
   }
 });
 
+// Guardado de Cita (Actualizado para guardar Duración y Ubicación)
 app.post("/appointment-request", async (req, res) => {
-    // Lógica básica para guardar la cita
-    // Asegúrate de guardar lat/lng para que el filtro de distancia funcione en el futuro
     try {
-        const { slot, clientData, location } = req.body; 
-        // slot debe traer { isoStart } del endpoint anterior
+        const { slot, clientData, location, durationMinutes = 60 } = req.body; 
         
         await db.collection("appointments").add({
             date: admin.firestore.Timestamp.fromDate(new Date(slot.isoStart)),
-            duration: 60, // O lo que marque el servicio
+            duration: durationMinutes, // Guardamos la duración real para futuros cálculos
             client: clientData,
-            location: location, // { lat: ..., lng: ... } IMPORTANTE
+            location: location, // { lat, lng } ESENCIAL para el clustering
             createdAt: admin.firestore.FieldValue.serverTimestamp()
         });
         res.json({ success: true });
@@ -278,4 +278,4 @@ app.post("/client-from-token", async(req,res)=>{
   if(d.exists) res.json(d.data()); else res.status(404).json({});
 });
 
-app.listen(PORT, () => console.log(`✅ Marsalva Server V12 (Smart Clustering) Running`));
+app.listen(PORT, () => console.log(`✅ Marsalva Server V13 (Strict Duration) Running`));
