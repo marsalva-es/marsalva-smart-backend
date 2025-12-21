@@ -1,4 +1,4 @@
-// server.js (V14 - FLEXIBLE CLUSTERING & STRICT TIME)
+// server.js (V15 - FILTROS VISUALES Y NOMBRES DE DÍAS)
 const express = require("express");
 const cors = require("cors");
 const admin = require("firebase-admin");
@@ -50,14 +50,22 @@ const verifyFirebaseUser = async (req, res, next) => {
 // =============== 3. UTILS ===============
 const MAX_DISTANCE_KM = 5; 
 
+// Horarios definidos
 const SCHEDULE = {
-  morning: { startHour: 9, endHour: 14 },
-  afternoon: { startHour: 16, endHour: 20 },
+  morning: { startHour: 9, endHour: 14, name: "morning" },
+  afternoon: { startHour: 16, endHour: 20, name: "afternoon" },
 };
 
 function toSpainDate(d=new Date()){return new Date(new Date(d).toLocaleString("en-US",{timeZone:"Europe/Madrid"}));}
 function getSpainNow(){return toSpainDate(new Date());}
 function addDays(d,days){return new Date(d.getTime() + days * 86400000);}
+
+// Formateador de días para que salga "Lunes 23" en la web
+function getDayLabel(dateObj) {
+  const days = ['Domingo', 'Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado'];
+  const months = ['Enero', 'Febrero', 'Marzo', 'Abril', 'Mayo', 'Junio', 'Julio', 'Agosto', 'Septiembre', 'Octubre', 'Noviembre', 'Diciembre'];
+  return `${days[dateObj.getDay()]} ${dateObj.getDate()} de ${months[dateObj.getMonth()]}`;
+}
 
 function getDistanceInKm(lat1, lon1, lat2, lon2) {
   const R = 6371; 
@@ -74,8 +82,8 @@ function isOverlapping(startA, endA, startB, endB) {
   return startA < endB && startB < endA;
 }
 
-// =============== 4. ADMIN ENDPOINTS ===============
-
+// =============== 4. ADMIN ENDPOINTS (IGUALES) ===============
+// (Copio los básicos para mantener funcionalidad, sin cambios aquí)
 app.get("/admin/config/homeserve", verifyFirebaseUser, async (req, res) => {
   try {
     const doc = await db.collection("settings").doc("homeserve").get();
@@ -107,25 +115,28 @@ app.get("/admin/services/homeserve", verifyFirebaseUser, async (req, res) => {
     res.json(services);
 });
 
-// =============== 5. LÓGICA DE CITAS FLEXIBLE (V14) ===============
+// =============== 5. LÓGICA DE CITAS (CORREGIDA V15) ===============
 
 app.post("/availability-smart", async (req, res) => {
   try {
-    const { lat, lng, durationMinutes = 60 } = req.body;
+    // AHORA LEEMOS 'timePreference' (mañana/tarde)
+    // Puede venir como timePreference o timeSlot, probamos ambos
+    const { lat, lng, durationMinutes = 60, timePreference, timeSlot } = req.body;
+    
+    // Detectar qué pidió el usuario (morning / afternoon / null)
+    const requestedTime = (timePreference || timeSlot || "").toLowerCase();
 
-    // AHORA: Verificamos si tenemos coordenadas válidas, pero NO bloqueamos si faltan.
     const hasCoords = (lat && lng && !isNaN(lat) && !isNaN(lng));
-
     const today = getSpainNow();
     const daysToCheck = 10;
     let availableSlots = [];
 
-    // 1. Obtener rango
+    // 1. Rango de búsqueda
     const startRange = new Date(today);
     startRange.setHours(0,0,0,0);
     const endRange = addDays(startRange, daysToCheck);
     
-    // 2. Cargar citas
+    // 2. Cargar citas existentes
     const snapshot = await db.collection("appointments")
       .where("date", ">=", startRange)
       .where("date", "<=", endRange)
@@ -146,7 +157,7 @@ app.post("/availability-smart", async (req, res) => {
     for (let i = 0; i < daysToCheck; i++) {
       const currentDay = addDays(today, i);
       const dayNum = currentDay.getDay();
-      if (dayNum === 0 || dayNum === 6) continue; // No findes
+      if (dayNum === 0 || dayNum === 6) continue; // Saltar findes
 
       const dayApps = existingApps.filter(app => 
         app.start.getDate() === currentDay.getDate() &&
@@ -155,7 +166,7 @@ app.post("/availability-smart", async (req, res) => {
 
       let dayIsBlockedByDistance = false;
 
-      // === REGLA 1: CLUSTERING (SOLO SI HAY COORDENADAS) ===
+      // REGLA 1: CLUSTERING (5KM)
       if (hasCoords && dayApps.length > 0) {
         for (const bookedApp of dayApps) {
           if (bookedApp.lat && bookedApp.lng) {
@@ -167,25 +178,34 @@ app.post("/availability-smart", async (req, res) => {
           }
         }
       }
-
-      // Si se bloqueó por distancia, saltamos. Si no tenía coords, esto nunca es true.
       if (dayIsBlockedByDistance) continue; 
 
-      // === REGLA 2: FRANJAS & DURACIÓN ===
-      const blocks = [SCHEDULE.morning, SCHEDULE.afternoon];
+      // === FILTRO DE MAÑANA / TARDE ===
+      // Si el usuario pidió "morning", solo usamos SCHEDULE.morning.
+      // Si pidió "afternoon", solo usamos SCHEDULE.afternoon.
+      // Si no pidió nada, usamos ambos.
+      
+      let blocksToUse = [];
+      if (requestedTime.includes('mañana') || requestedTime.includes('morning')) {
+         blocksToUse.push(SCHEDULE.morning);
+      } else if (requestedTime.includes('tarde') || requestedTime.includes('afternoon')) {
+         blocksToUse.push(SCHEDULE.afternoon);
+      } else {
+         blocksToUse = [SCHEDULE.morning, SCHEDULE.afternoon];
+      }
 
-      for (const block of blocks) {
+      for (const block of blocksToUse) {
         for (let hour = block.startHour; hour < block.endHour; hour++) {
           
           const slotStart = new Date(currentDay);
           slotStart.setHours(hour, 0, 0, 0);
           
           const windowEnd = new Date(currentDay);
-          windowEnd.setHours(hour + 1, 0, 0, 0); // Visual: 9-10
+          windowEnd.setHours(hour + 1, 0, 0, 0); // Visual: 09:00 - 10:00
 
-          const workEnd = new Date(slotStart.getTime() + durationMinutes * 60000); // Real: 9-10:30
+          const workEnd = new Date(slotStart.getTime() + durationMinutes * 60000); // Real: 09:00 - 10:xx
 
-          if (slotStart < new Date()) continue;
+          if (slotStart < new Date()) continue; // No horas pasadas
 
           let isOccupied = false;
           for (const booked of dayApps) {
@@ -199,11 +219,14 @@ app.post("/availability-smart", async (req, res) => {
             const startStr = slotStart.toLocaleTimeString("es-ES", { hour: '2-digit', minute: '2-digit' });
             const endStr = windowEnd.toLocaleTimeString("es-ES", { hour: '2-digit', minute: '2-digit' });
             
+            // Texto EXACTO que pediste
+            const label = `${startStr} - ${endStr}`; 
+            
             availableSlots.push({
               date: slotStart.toISOString().split('T')[0],
               startTime: startStr,
               endTime: endStr,
-              label: `${startStr} - ${endStr}`,
+              label: label, // Esto debería salir en el botón
               message: `La visita se realizará entre las ${startStr} y las ${endStr}`,
               isoStart: slotStart.toISOString() 
             });
@@ -212,22 +235,30 @@ app.post("/availability-smart", async (req, res) => {
       }
     }
 
+    // AGRUPAR POR DÍA CON FORMATO BONITO
     const grouped = availableSlots.reduce((acc, slot) => {
       if (!acc[slot.date]) acc[slot.date] = [];
       acc[slot.date].push(slot);
       return acc;
     }, {});
 
-    const responseArray = Object.keys(grouped).map(dateKey => ({
-      date: dateKey,
-      slots: grouped[dateKey]
-    }));
+    const responseArray = Object.keys(grouped).map(dateKey => {
+      // Truco: Creamos el objeto fecha para sacar el nombre del día
+      const dateObj = new Date(dateKey); 
+      const labelDia = getDayLabel(dateObj); // "Lunes 23 de Octubre"
+
+      return {
+        date: dateKey,       // Para lógica
+        dayLabel: labelDia,  // Para mostrar en la web (soluciona el punto azul vacío)
+        title: labelDia,     // Redundancia por si tu front usa 'title'
+        slots: grouped[dateKey]
+      };
+    });
 
     res.json({ days: responseArray });
 
   } catch (error) {
     console.error("Error availability:", error);
-    // En caso de error fatal, devolvemos array vacío para no romper el front
     res.json({ days: [] }); 
   }
 });
@@ -235,12 +266,11 @@ app.post("/availability-smart", async (req, res) => {
 app.post("/appointment-request", async (req, res) => {
     try {
         const { slot, clientData, location, durationMinutes = 60 } = req.body; 
-        
         await db.collection("appointments").add({
             date: admin.firestore.Timestamp.fromDate(new Date(slot.isoStart)),
             duration: durationMinutes, 
             client: clientData,
-            location: location || null, // Guardamos null si no viene
+            location: location || null,
             createdAt: admin.firestore.FieldValue.serverTimestamp()
         });
         res.json({ success: true });
@@ -254,4 +284,4 @@ app.post("/client-from-token", async(req,res)=>{
   if(d.exists) res.json(d.data()); else res.status(404).json({});
 });
 
-app.listen(PORT, () => console.log(`✅ Marsalva Server V14 (Flexible) Running`));
+app.listen(PORT, () => console.log(`✅ Marsalva Server V15 (Fixed UI) Running`));
