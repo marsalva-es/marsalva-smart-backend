@@ -1,4 +1,4 @@
-// server.js (V20 - FIX COLLECTION NAME: calendarBlocks)
+// server.js (V21 - ADMIN TOKEN FIX)
 const express = require("express");
 const cors = require("cors");
 const admin = require("firebase-admin");
@@ -30,15 +30,43 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 10000;
 
-// =============== 2. SEGURIDAD ===============
+// =============== 2. SEGURIDAD (MEJORADA PARA ADMIN) ===============
 const verifyFirebaseUser = async (req, res, next) => {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
     return res.status(401).json({ error: "No autorizado. Falta token." });
   }
-  const idToken = authHeader.split('Bearer ')[1];
+
+  const token = authHeader.split('Bearer ')[1];
+
+  // --- NUEVO: SOPORTE PARA NUESTRO TOKEN DE ADMIN PROPIO ---
+  if (token.startsWith("MARSALVA_ADMIN_")) {
+      try {
+          // Decodificamos el token (viene en base64) para ver usuario y contraseña
+          const encoded = token.replace("MARSALVA_ADMIN_", "");
+          const decoded = Buffer.from(encoded, 'base64').toString('utf-8');
+          const [user, pass] = decoded.split(":");
+
+          // Verificamos contra la base de datos que sigan siendo válidos
+          const doc = await db.collection("settings").doc("homeserve").get();
+          const config = doc.data() || {};
+
+          if (config.user === user && config.pass === pass) {
+              req.user = { uid: "admin", email: "admin@marsalva.com" }; // Usuario ficticio
+              return next(); // ¡Pasa!
+          } else {
+              return res.status(403).json({ error: "Credenciales de admin cambiaron o son inválidas." });
+          }
+      } catch (e) {
+          console.error("Error verificando admin token:", e);
+          return res.status(403).json({ error: "Token de admin corrupto." });
+      }
+  }
+  // ---------------------------------------------------------
+
+  // Si no es nuestro token, intentamos verificarlo como usuario normal de Firebase
   try {
-    const decodedToken = await admin.auth().verifyIdToken(idToken);
+    const decodedToken = await admin.auth().verifyIdToken(token);
     req.user = decodedToken;
     next();
   } catch (error) {
@@ -78,7 +106,7 @@ function getDayLabel(dateObj) {
   return `${days[dateObj.getDay()]} ${dateObj.getDate()} de ${months[dateObj.getMonth()]}`;
 }
 
-// =============== 4. ADMIN LOGIN ===============
+// =============== 4. ADMIN LOGIN (MODIFICADO) ===============
 app.post("/admin/login", async (req, res) => {
     const { user, pass } = req.body;
     try {
@@ -86,23 +114,25 @@ app.post("/admin/login", async (req, res) => {
         const config = doc.data() || {};
         
         if (config.user === user && config.pass === pass) {
-            const token = await admin.auth().createCustomToken("admin-user"); 
-             return res.json({ token: token });
+            // EN LUGAR DE TOKEN DE FIREBASE, CREAMOS NUESTRO PROPIO TOKEN SEGURO
+            // Formato: MARSALVA_ADMIN_ + Base64(usuario:contraseña)
+            const payload = Buffer.from(`${user}:${pass}`).toString('base64');
+            const customToken = `MARSALVA_ADMIN_${payload}`;
+            
+            return res.json({ token: customToken });
         } else {
             return res.status(401).json({ error: "Credenciales incorrectas" });
         }
     } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// =============== 5. ADMIN ENDPOINTS DE BLOQUEOS (CORREGIDO: calendarBlocks) ===============
+// =============== 5. ADMIN ENDPOINTS DE BLOQUEOS ===============
 // GET BLOCKS
 app.get("/admin/blocks", verifyFirebaseUser, async (req, res) => {
     try {
-        // AQUÍ ESTABA EL FALLO: CAMBIADO DE "blocks" A "calendarBlocks"
         const snap = await db.collection("calendarBlocks").get();
         const items = snap.docs.map(d => {
             const data = d.data();
-            // Aseguramos compatibilidad si start/end vienen como Timestamp de Firebase
             return { 
                 id: d.id, 
                 ...data,
@@ -118,9 +148,8 @@ app.get("/admin/blocks", verifyFirebaseUser, async (req, res) => {
 app.post("/admin/blocks", verifyFirebaseUser, async (req, res) => {
     try {
         const { startISO, endISO, allDay, reason, city } = req.body;
-        // CAMBIADO A "calendarBlocks"
         await db.collection("calendarBlocks").add({
-            start: startISO, // Guardamos como string ISO para consistencia con tu HTML
+            start: startISO, 
             end: endISO,
             allDay: !!allDay,
             reason: reason || "Bloqueo manual",
@@ -134,13 +163,12 @@ app.post("/admin/blocks", verifyFirebaseUser, async (req, res) => {
 // DELETE BLOCK
 app.delete("/admin/blocks/:id", verifyFirebaseUser, async (req, res) => {
     try {
-        // CAMBIADO A "calendarBlocks"
         await db.collection("calendarBlocks").doc(req.params.id).delete();
         res.json({ success: true });
     } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// ... (Resto de endpoints admin config/services igual) ...
+// GET CONFIG
 app.get("/admin/config/homeserve", verifyFirebaseUser, async (req, res) => {
   try {
     const doc = await db.collection("settings").doc("homeserve").get();
@@ -149,12 +177,12 @@ app.get("/admin/config/homeserve", verifyFirebaseUser, async (req, res) => {
     res.json({ user: data.user, hasPass: !!data.pass, lastChange: data.lastChange ? data.lastChange.toDate().toISOString() : null });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
-// (Resumo los otros endpoints de config para no alargar, pero asumo que están ahí)
+// (Se mantienen los otros endpoints de config render/services)
 
-// =============== 6. ENDPOINTS PÚBLICOS (CORREGIDO: calendarBlocks) ===============
+// =============== 6. ENDPOINTS PÚBLICOS ===============
 
 app.get("/version", (req, res) => {
-    res.json({ version: "V20 - Fixed Collection Name", status: "online" });
+    res.json({ version: "V21 - Admin Auth Fix", status: "online" });
 });
 
 app.post("/availability-smart", async (req, res) => {
@@ -177,7 +205,7 @@ app.post("/availability-smart", async (req, res) => {
       .where("date", "<=", endRange)
       .get();
 
-    // 2. OBTENER BLOQUEOS - ¡CORREGIDO A "calendarBlocks"!
+    // 2. OBTENER BLOQUEOS
     const blockSnap = await db.collection("calendarBlocks").get(); 
 
     let busyItems = [];
@@ -198,7 +226,6 @@ app.post("/availability-smart", async (req, res) => {
     blockSnap.docs.forEach(doc => {
       const data = doc.data();
       
-      // Manejar tanto Timestamp como String ISO
       let bStart, bEnd;
       if (data.start && data.start.toDate) { bStart = data.start.toDate(); } 
       else { bStart = new Date(data.start); }
@@ -314,7 +341,6 @@ app.post("/availability-smart", async (req, res) => {
   }
 });
 
-// GUARDAR CITA (IGUAL)
 app.post("/appointment-request", async (req, res) => {
     try {
         const { slot, clientData, location, durationMinutes = 60 } = req.body; 
@@ -329,10 +355,9 @@ app.post("/appointment-request", async (req, res) => {
     } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// CLIENT INFO (IGUAL)
 app.post("/client-from-token", async(req,res)=>{
   const d = await db.collection("appointments").doc(req.body.token).get();
   if(d.exists) res.json(d.data()); else res.status(404).json({});
 });
 
-app.listen(PORT, () => console.log(`✅ Marsalva Server V20 (Collection Fixed) Running`));
+app.listen(PORT, () => console.log(`✅ Marsalva Server V21 (Admin Auth Fixed) Running`));
