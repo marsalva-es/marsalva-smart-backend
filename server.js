@@ -54,24 +54,17 @@ const HOME_ALGECIRAS = { lat: 36.1408, lng: -5.4562 };
 const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY || "";
 const geocodeCache = new Map();
 
-// ⬇️ Cambiado para permitir franjas 09:00–14:00 exactas
+// ✅ Franjas exactas por hora (lo que pediste)
 const SCHEDULE = {
   morning: { startHour: 9, startMinute: 0, endHour: 14, endMinute: 0 },
   afternoon: { startHour: 17, startMinute: 0, endHour: 20, endMinute: 0 },
 };
-
-// Franjas fijas de 60 min
 const WINDOW_MINUTES = 60;
-
-// Máxima distancia entre citas del mismo día (km)
 const MAX_KM_BETWEEN_VISITS = 5;
 
 // =============== 3.1 UTILIDADES FECHAS / HORAS ===============
 function toSpainDate(d = new Date()) {
   return new Date(new Date(d).toLocaleString("en-US", { timeZone: "Europe/Madrid" }));
-}
-function getSpainNow() {
-  return toSpainDate(new Date());
 }
 function addMinutes(d, m) {
   return new Date(d.getTime() + m * 60000);
@@ -94,12 +87,6 @@ function formatDateYYYYMMDD(d) {
   const day = String(x.getDate()).padStart(2, "0");
   return `${y}-${m}-${day}`;
 }
-function normalizeBlock(b) {
-  const s = String(b || "").toLowerCase();
-  if (s.includes("tard")) return "afternoon";
-  if (s.includes("after")) return "afternoon";
-  return "morning";
-}
 function isWeekendES(d) {
   const n = toSpainDate(d).getDay();
   return n === 0 || n === 6;
@@ -118,6 +105,45 @@ function parseHHMM(hhmm) {
 }
 function overlaps(aStart, aEnd, bStart, bEnd) {
   return aStart < bEnd && bStart < aEnd;
+}
+function normalizeBlock(b) {
+  const s = String(b || "").toLowerCase().trim();
+  if (s === "afternoon" || s.includes("tard")) return "afternoon";
+  return "morning";
+}
+
+// ✅ Parsea fechas en varios formatos: YYYY-MM-DD, DD/MM/YYYY, D/M/YYYY
+function parseDateAny(v) {
+  if (!v) return null;
+
+  // Firestore Timestamp
+  if (v?.toDate) {
+    const d = toSpainDate(v.toDate());
+    d.setHours(0, 0, 0, 0);
+    return d;
+  }
+
+  const s = String(v).trim();
+
+  // YYYY-MM-DD
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
+    const d = toSpainDate(new Date(s + "T00:00:00"));
+    d.setHours(0, 0, 0, 0);
+    return d;
+  }
+
+  // DD/MM/YYYY or D/M/YYYY
+  const m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (m) {
+    const dd = Number(m[1]);
+    const mm = Number(m[2]);
+    const yy = Number(m[3]);
+    const d = toSpainDate(new Date(yy, mm - 1, dd));
+    d.setHours(0, 0, 0, 0);
+    return d;
+  }
+
+  return null;
 }
 
 // =============== 3.2 GEO / DISTANCIA ===============
@@ -138,118 +164,153 @@ async function geocodeAddress(address, city) {
   const resp = await fetch(url);
   if (!resp.ok) return null;
   const data = await resp.json();
-  if (!data.results || !data.results.length) return null;
-
-  const loc = data.results[0].geometry?.location;
+  const loc = data?.results?.[0]?.geometry?.location;
   const out = loc && typeof loc.lat === "number" && typeof loc.lng === "number" ? loc : null;
   geocodeCache.set(full, out);
   return out;
 }
-
-// Haversine km
 function distanceKm(a, b) {
   if (!a || !b) return Infinity;
   const R = 6371;
   const dLat = ((b.lat - a.lat) * Math.PI) / 180;
   const dLng = ((b.lng - a.lng) * Math.PI) / 180;
   const s1 = Math.sin(dLat / 2) ** 2;
-  const s2 = Math.cos((a.lat * Math.PI) / 180) * Math.cos((b.lat * Math.PI) / 180) * Math.sin(dLng / 2) ** 2;
+  const s2 =
+    Math.cos((a.lat * Math.PI) / 180) *
+    Math.cos((b.lat * Math.PI) / 180) *
+    Math.sin(dLng / 2) ** 2;
   return 2 * R * Math.asin(Math.sqrt(s1 + s2));
 }
 
-// =============== 3.3 LECTURA CITAS EXISTENTES ===============
+// =============== 3.3 LECTURA CITA EXISTENTE (MUY ROBUSTA) ===============
+
+// Si tu agenda tiene estados, aquí puedes ampliar.
 function isCancelledAppointment(data) {
-  const st = String(data.status || data.state || "").toLowerCase();
+  const st = String(data.status || data.state || data.robotStatus || "").toLowerCase();
   return data.cancelled === true || data.canceled === true || st.includes("cancel");
 }
 
-// Intenta sacar date + start/end de varios formatos típicos
-function extractAppointmentInterval(data) {
-  // 1) date en string YYYY-MM-DD
-  const dateStr = data.date || data.scheduledDateString || data.day;
-  // 2) scheduledDate como Timestamp
-  const scheduledTs = data.scheduledDate?.toDate ? data.scheduledDate.toDate() : null;
-  // 3) start as Timestamp
-  const startTs = data.start?.toDate ? data.start.toDate() : null;
+// Esto intenta sacar (date + start/end) de MUCHAS variantes de campos.
+// Así no te vuelve a pasar lo de “lunes lleno pero te lo ofrece”.
+function extractIntervalAny(doc) {
+  const d = doc || {};
 
-  const startTime = data.startTime || data.start_hour || data.hourStart;
-  const endTime = data.endTime || data.end_hour || data.hourEnd;
+  // Campos de fecha posibles
+  const baseDate =
+    parseDateAny(d.date) ||
+    parseDateAny(d.scheduledDate) ||
+    parseDateAny(d.requestedDate) ||
+    parseDateAny(d.day) ||
+    parseDateAny(d.dateString) ||
+    parseDateAny(d.requestedDateString) ||
+    parseDateAny(d.startDate) ||
+    parseDateAny(d.start) ||
+    null;
 
-  let baseDate = null;
-  if (typeof dateStr === "string" && /^\d{4}-\d{2}-\d{2}$/.test(dateStr.trim())) {
-    baseDate = toSpainDate(new Date(dateStr.trim() + "T00:00:00"));
-  } else if (scheduledTs) {
-    baseDate = toSpainDate(scheduledTs);
-    baseDate.setHours(0, 0, 0, 0);
-  } else if (startTs) {
-    baseDate = toSpainDate(startTs);
-    baseDate.setHours(0, 0, 0, 0);
+  // Campos de start/end como HH:mm
+  const st =
+    parseHHMM(d.startTime) ||
+    parseHHMM(d.requestedStartTime) ||
+    parseHHMM(d.inicio) ||
+    parseHHMM(d.horaInicio) ||
+    parseHHMM(d.start_hour) ||
+    null;
+
+  const en =
+    parseHHMM(d.endTime) ||
+    parseHHMM(d.requestedEndTime) ||
+    parseHHMM(d.fin) ||
+    parseHHMM(d.horaFin) ||
+    parseHHMM(d.end_hour) ||
+    null;
+
+  // Campos timestamp completos
+  const startTs =
+    (d.startDate?.toDate && toSpainDate(d.startDate.toDate())) ||
+    (d.start?.toDate && toSpainDate(d.start.toDate())) ||
+    (d.scheduledStart?.toDate && toSpainDate(d.scheduledStart.toDate())) ||
+    null;
+
+  const endTs =
+    (d.endDate?.toDate && toSpainDate(d.endDate.toDate())) ||
+    (d.end?.toDate && toSpainDate(d.end.toDate())) ||
+    (d.scheduledEnd?.toDate && toSpainDate(d.scheduledEnd.toDate())) ||
+    null;
+
+  // Si tenemos timestamps reales: perfecto
+  if (startTs && endTs) {
+    const dateKey = formatDateYYYYMMDD(startTs);
+    return { start: startTs, end: endTs, dateKey };
   }
 
-  const st = parseHHMM(startTime);
-  const en = parseHHMM(endTime);
-
-  // Si tenemos timestamps completos, úsalo
-  if (startTs && data.end?.toDate) {
-    const s = toSpainDate(startTs);
-    const e = toSpainDate(data.end.toDate());
-    return { start: s, end: e, dateKey: formatDateYYYYMMDD(s) };
+  // Si tenemos baseDate + HH:mm
+  if (baseDate && st && en) {
+    const start = setTime(baseDate, st.h, st.m);
+    const end = setTime(baseDate, en.h, en.m);
+    const dateKey = formatDateYYYYMMDD(baseDate);
+    return { start, end, dateKey };
   }
 
-  if (!baseDate || !st || !en) return null;
+  // Si tenemos baseDate + start y duración
+  const dur = parseDurationMinutes(d.durationMinutes || d.duration || 0);
+  if (baseDate && st && dur) {
+    const start = setTime(baseDate, st.h, st.m);
+    const end = addMinutes(start, dur);
+    const dateKey = formatDateYYYYMMDD(baseDate);
+    return { start, end, dateKey };
+  }
 
-  const start = setTime(baseDate, st.h, st.m);
-  const end = setTime(baseDate, en.h, en.m);
-  return { start, end, dateKey: formatDateYYYYMMDD(baseDate) };
+  return null;
 }
 
-async function loadAppointmentsInRange(fromDate, toDateExclusive) {
-  // OJO: Firestore no deja OR fácil; cargamos por rango de fechas si guardas "date" (YYYY-MM-DD).
-  // Si no guardas "date", esto seguirá funcionando por fallback, pero será menos eficiente.
-  const fromKey = formatDateYYYYMMDD(fromDate);
-  const toKey = formatDateYYYYMMDD(addDays(toDateExclusive, 0)); // exclusivo
+async function loadBusyIntervals(fromDate, toDateExclusive) {
+  // ✅ Aquí va la clave: NO dependemos de un where por "date".
+  // Cargamos un bloque razonable de docs y filtramos por rango parseando.
+  // Con 85 citas va sobrado y no rompe nada.
 
   let docs = [];
-
-  // Si tienes el campo "date" como YYYY-MM-DD
   try {
-    const snap = await db
-      .collection("appointments")
-      .where("date", ">=", fromKey)
-      .where("date", "<", toKey)
-      .get();
-    docs = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-  } catch (e) {
-    // Si no existe ese índice/campo, fallback: carga últimas N (no ideal, pero no rompe)
-    const snap = await db.collection("appointments").orderBy("createdAt", "desc").limit(400).get();
-    docs = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+    // si tienes createdAt
+    const snap = await db.collection("appointments").orderBy("createdAt", "desc").limit(1200).get();
+    docs = snap.docs.map((x) => ({ id: x.id, ...x.data() }));
+  } catch (e1) {
+    try {
+      // si no tienes createdAt, intenta updatedAt
+      const snap = await db.collection("appointments").orderBy("updatedAt", "desc").limit(1200).get();
+      docs = snap.docs.map((x) => ({ id: x.id, ...x.data() }));
+    } catch (e2) {
+      // fallback final
+      const snap = await db.collection("appointments").limit(1200).get();
+      docs = snap.docs.map((x) => ({ id: x.id, ...x.data() }));
+    }
   }
 
-  // Filtra y normaliza a intervalos
-  const intervals = [];
+  const out = [];
   for (const a of docs) {
     if (isCancelledAppointment(a)) continue;
-    const it = extractAppointmentInterval(a);
+    const it = extractIntervalAny(a);
     if (!it) continue;
 
-    // Solo dentro de rango
+    // Filtra por rango
     if (it.start >= toDateExclusive || it.end < fromDate) continue;
 
-    intervals.push({
+    out.push({
       id: a.id,
       dateKey: it.dateKey,
       start: it.start,
       end: it.end,
-      city: (a.city || a.locality || "").toString().trim(),
-      address: (a.address || a.direccion || "").toString().trim(),
+      city: String(a.city || a.locality || a.poblacion || "").trim(),
+      address: String(a.address || a.direccion || "").trim(),
       lat: typeof a.lat === "number" ? a.lat : (a.location?.lat ?? null),
       lng: typeof a.lng === "number" ? a.lng : (a.location?.lng ?? null),
     });
   }
-  return intervals;
+
+  return out;
 }
 
-// =============== 4. ENDPOINTS PROTEGIDOS ===============
+// =============== 4. ENDPOINTS PROTEGIDOS (USAN verifyFirebaseUser) ===============
+
 app.get("/admin/config/homeserve", verifyFirebaseUser, async (req, res) => {
   try {
     const doc = await db.collection("settings").doc("homeserve").get();
@@ -269,11 +330,7 @@ app.post("/admin/config/homeserve", verifyFirebaseUser, async (req, res) => {
   try {
     const { user, pass } = req.body;
     await db.collection("settings").doc("homeserve").set(
-      {
-        user,
-        pass,
-        lastChange: admin.firestore.FieldValue.serverTimestamp(),
-      },
+      { user, pass, lastChange: admin.firestore.FieldValue.serverTimestamp() },
       { merge: true }
     );
     res.json({ success: true });
@@ -315,7 +372,7 @@ app.post("/admin/services/homeserve/delete", verifyFirebaseUser, async (req, res
 
 // =============== 5. ENDPOINTS PÚBLICOS (CITAS) ===============
 
-// CLIENT INFO (token == docId)
+// CLIENT INFO
 app.post("/client-from-token", async (req, res) => {
   const token = String(req.body.token || "").trim();
   const d = await db.collection("appointments").doc(token).get();
@@ -323,8 +380,7 @@ app.post("/client-from-token", async (req, res) => {
   else res.status(404).json({});
 });
 
-// === AVAILABILITY SMART ===
-// Devuelve franjas de 1 hora, sin solapar con citas ya existentes, y respetando bloque.
+// ✅ AVAILABILITY SMART (FRANJAS 1H + NO SOLAPE + MISMA LOCALIDAD + 5KM si hay API)
 app.post("/availability-smart", async (req, res) => {
   try {
     const token = String(req.body.token || "").trim();
@@ -333,27 +389,30 @@ app.post("/availability-smart", async (req, res) => {
 
     if (!token) return res.status(400).json({ error: "Falta token" });
 
-    // Cita/servicio del cliente (para dirección/ciudad)
     const apDoc = await db.collection("appointments").doc(token).get();
     if (!apDoc.exists) return res.status(404).json({ error: "Token no encontrado" });
     const apData = apDoc.data() || {};
 
-    const serviceCity = String(apData.city || apData.locality || "").trim();
+    const serviceCity = String(apData.city || apData.locality || apData.poblacion || "").trim();
     const serviceAddress = String(apData.address || apData.direccion || "").trim();
     const durationMin = parseDurationMinutes(apData.durationMinutes || apData.duration || 60);
 
-    // Rango fechas
-    const now = getSpainNow();
+    const now = toSpainDate(new Date());
     const startDay = toSpainDate(now);
     startDay.setHours(0, 0, 0, 0);
     const endDayExclusive = addDays(startDay, rangeDays);
 
-    // Cargar citas existentes (ocupadas)
-    const existing = await loadAppointmentsInRange(startDay, endDayExclusive);
+    // ✅ Cargar ocupación real (robusto)
+    const busy = await loadBusyIntervals(startDay, endDayExclusive);
 
-    // Geocode del servicio (solo si hay API)
+    // Debug útil (Render logs)
+    console.log(
+      `📌 availability-smart block=${block} rangeDays=${rangeDays} busyIntervals=${busy.length}`
+    );
+
+    // Geo del servicio (solo si hay API)
     const serviceLoc =
-      typeof apData.lat === "number" && typeof apData.lng === "number"
+      (typeof apData.lat === "number" && typeof apData.lng === "number")
         ? { lat: apData.lat, lng: apData.lng }
         : await geocodeAddress(serviceAddress, serviceCity);
 
@@ -364,25 +423,23 @@ app.post("/availability-smart", async (req, res) => {
       if (isWeekendES(day)) continue;
 
       const dayKey = formatDateYYYYMMDD(day);
+      const dayBusy = busy.filter((x) => x.dateKey === dayKey);
 
-      const dayAppointments = existing.filter((x) => x.dateKey === dayKey);
-
-      // Regla “misma localidad”: si ya hay citas ese día y hay city, exige ciudad igual
-      const focusCity = dayAppointments.find((x) => x.city)?.city || "";
+      // ✅ Regla “misma localidad”: si ese día ya hay citas con city, solo ofrecemos si coincide
+      const focusCity = String(dayBusy.find((x) => x.city)?.city || "").trim();
       if (focusCity && serviceCity && focusCity.toLowerCase() !== serviceCity.toLowerCase()) {
         continue;
       }
 
-      // Generar franjas del bloque
       const sch = SCHEDULE[block];
       const blockStart = setTime(day, sch.startHour, sch.startMinute);
       const blockEnd = setTime(day, sch.endHour, sch.endMinute);
 
-      // Franjas alineadas a la hora (09:00, 10:00…)
-      // Ajuste: empezamos en la siguiente hora exacta desde blockStart
+      // Franjas exactas: 09:00,10:00,11:00...
       let cursor = new Date(blockStart);
       cursor.setMinutes(0, 0, 0);
 
+      // Por si blockStart no es hora exacta (aquí es 0, pero lo dejamos seguro)
       if (cursor < blockStart) cursor = addMinutes(cursor, 60);
 
       const slots = [];
@@ -391,30 +448,28 @@ app.post("/availability-smart", async (req, res) => {
         const winStart = new Date(cursor);
         const winEnd = addMinutes(cursor, WINDOW_MINUTES);
 
-        // Para que la visita “quepa”, usamos durationMin desde el inicio de la franja.
+        // La visita empieza al inicio de la franja; si dura más de 60, se permite mientras no salga del bloque
         const visitStart = winStart;
         const visitEnd = addMinutes(winStart, durationMin);
 
-        // 1) Debe caber dentro del bloque (y dentro de la franja si duration > 60, al menos que no pase del bloque)
         if (visitEnd > blockEnd) {
           cursor = addMinutes(cursor, 60);
           continue;
         }
 
-        // 2) No solapar con citas existentes de ese día
-        const conflict = dayAppointments.some((a) => overlaps(visitStart, visitEnd, a.start, a.end));
+        // ✅ No solape con ocupadas
+        const conflict = dayBusy.some((a) => overlaps(visitStart, visitEnd, a.start, a.end));
         if (conflict) {
           cursor = addMinutes(cursor, 60);
           continue;
         }
 
-        // 3) Regla 5km (si podemos geocodificar)
-        if (dayAppointments.length && GOOGLE_MAPS_API_KEY && serviceLoc) {
-          // Geocode citas existentes si no traen lat/lng
+        // ✅ Regla 5km (solo si hay API y podemos geocodificar)
+        if (dayBusy.length && GOOGLE_MAPS_API_KEY && serviceLoc) {
           let ok = true;
-          for (const a of dayAppointments) {
+          for (const a of dayBusy) {
             const aLoc =
-              typeof a.lat === "number" && typeof a.lng === "number"
+              (typeof a.lat === "number" && typeof a.lng === "number")
                 ? { lat: a.lat, lng: a.lng }
                 : await geocodeAddress(a.address, a.city);
 
@@ -430,15 +485,12 @@ app.post("/availability-smart", async (req, res) => {
           }
         }
 
-        slots.push({
-          startTime: formatTime(winStart),
-          endTime: formatTime(winEnd),
-        });
+        // ✅ OK -> añadimos franja
+        slots.push({ startTime: formatTime(winStart), endTime: formatTime(winEnd) });
 
         cursor = addMinutes(cursor, 60);
       }
 
-      // Si no hay slots, no devolvemos ese día
       if (slots.length) {
         const label = day.toLocaleDateString("es-ES", {
           weekday: "long",
@@ -449,13 +501,6 @@ app.post("/availability-smart", async (req, res) => {
       }
     }
 
-    // Preferencia: días donde ya tienes citas (misma ciudad) primero
-    daysOut.sort((a, b) => {
-      const aHas = existing.some((x) => x.dateKey === a.date);
-      const bHas = existing.some((x) => x.dateKey === b.date);
-      return Number(bHas) - Number(aHas);
-    });
-
     return res.json({ days: daysOut });
   } catch (e) {
     console.error("❌ availability-smart:", e);
@@ -463,8 +508,7 @@ app.post("/availability-smart", async (req, res) => {
   }
 });
 
-// === APPOINTMENT REQUEST ===
-// Guarda la solicitud del cliente (bloque + fecha + franja) y crea un ChangeRequest para tu app.
+// ✅ APPOINTMENT REQUEST (igual que tu flujo de ChangeRequests)
 app.post("/appointment-request", async (req, res) => {
   try {
     const token = String(req.body.token || "").trim();
@@ -483,10 +527,24 @@ app.post("/appointment-request", async (req, res) => {
 
     const ap = apSnap.data() || {};
 
-    const requestedDateString = date;
     const requestedDate = admin.firestore.Timestamp.fromDate(new Date(date + "T00:00:00"));
+    const requestedDateString = date;
 
-    const changePayload = {
+    // 1) Guardar en la cita
+    await apRef.set(
+      {
+        requestedBlock: block,
+        requestedDate,
+        requestedDateString,
+        requestedStartTime: startTime,
+        requestedEndTime: endTime,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    // 2) Crear changeRequest para que tu app lo vea
+    await db.collection("changeRequests").add({
       token,
       appointmentId: token,
       source: "web_client",
@@ -500,33 +558,15 @@ app.post("/appointment-request", async (req, res) => {
       requestedStartTime: startTime,
       requestedEndTime: endTime,
 
-      // Datos del cliente (si existen)
       clientName: ap.clientName || ap.name || ap.nombre || "",
       clientPhone: ap.phone || ap.clientPhone || "",
       address: ap.address || "",
       city: ap.city || "",
       zip: ap.zip || "",
-      originalDate: ap.date || null,
 
       acceptedDate: null,
       resolvedAppointmentDocId: null,
-    };
-
-    // 1) Guarda la solicitud también en la cita
-    await apRef.set(
-      {
-        requestedBlock: block,
-        requestedDate,
-        requestedDateString,
-        requestedStartTime: startTime,
-        requestedEndTime: endTime,
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      },
-      { merge: true }
-    );
-
-    // 2) Crea el changeRequest (tu app lo escucha)
-    await db.collection("changeRequests").add(changePayload);
+    });
 
     return res.json({ success: true });
   } catch (e) {
@@ -535,4 +575,4 @@ app.post("/appointment-request", async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`✅ Marsalva Server V11 (Secure Auth) Running on ${PORT}`));
+app.listen(PORT, () => console.log(`✅ Marsalva Server V11 (Secure Auth) Running`));
