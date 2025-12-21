@@ -1,4 +1,4 @@
-// server.js (V13 - STRICT TIME WINDOWS & GEO CLUSTERING)
+// server.js (V14 - FLEXIBLE CLUSTERING & STRICT TIME)
 const express = require("express");
 const cors = require("cors");
 const admin = require("firebase-admin");
@@ -30,7 +30,7 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 10000;
 
-// =============== 2. SEGURIDAD (MIDDLEWARE) ===============
+// =============== 2. SEGURIDAD ===============
 const verifyFirebaseUser = async (req, res, next) => {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -47,23 +47,20 @@ const verifyFirebaseUser = async (req, res, next) => {
   }
 };
 
-// =============== 3. CONFIGURACIÓN y UTILS ===============
-// Regla: No desplazarse más de 5km de una visita a otra en el mismo día
+// =============== 3. UTILS ===============
 const MAX_DISTANCE_KM = 5; 
 
-// Horario: Franjas enteras
 const SCHEDULE = {
-  morning: { startHour: 9, endHour: 14 },    // Genera: 9-10, 10-11, ... 13-14
-  afternoon: { startHour: 16, endHour: 20 }, // Genera: 16-17, ... 19-20
+  morning: { startHour: 9, endHour: 14 },
+  afternoon: { startHour: 16, endHour: 20 },
 };
 
 function toSpainDate(d=new Date()){return new Date(new Date(d).toLocaleString("en-US",{timeZone:"Europe/Madrid"}));}
 function getSpainNow(){return toSpainDate(new Date());}
 function addDays(d,days){return new Date(d.getTime() + days * 86400000);}
 
-// Fórmula Haversine (Cálculo preciso de distancia en KM)
 function getDistanceInKm(lat1, lon1, lat2, lon2) {
-  const R = 6371; // Radio Tierra km
+  const R = 6371; 
   const dLat = (lat2 - lat1) * (Math.PI/180);
   const dLon = (lon2 - lon1) * (Math.PI/180);
   const a = 
@@ -73,13 +70,11 @@ function getDistanceInKm(lat1, lon1, lat2, lon2) {
   return R * c;
 }
 
-// Verifica superposición de rangos de tiempo
 function isOverlapping(startA, endA, startB, endB) {
   return startA < endB && startB < endA;
 }
 
-// =============== 4. ENDPOINTS PROTEGIDOS (ADMIN) ===============
-// (Sin cambios, manteniendo tu lógica funcional)
+// =============== 4. ADMIN ENDPOINTS ===============
 
 app.get("/admin/config/homeserve", verifyFirebaseUser, async (req, res) => {
   try {
@@ -112,25 +107,25 @@ app.get("/admin/services/homeserve", verifyFirebaseUser, async (req, res) => {
     res.json(services);
 });
 
-// =============== 5. LÓGICA DE CITAS INTELIGENTE (OPTIMIZADA V13) ===============
+// =============== 5. LÓGICA DE CITAS FLEXIBLE (V14) ===============
 
 app.post("/availability-smart", async (req, res) => {
   try {
-    // Recibimos lat/lng y la DURACIÓN real del servicio (default 60 min)
     const { lat, lng, durationMinutes = 60 } = req.body;
 
-    if (!lat || !lng) return res.status(400).json({ error: "Faltan coordenadas" });
+    // AHORA: Verificamos si tenemos coordenadas válidas, pero NO bloqueamos si faltan.
+    const hasCoords = (lat && lng && !isNaN(lat) && !isNaN(lng));
 
     const today = getSpainNow();
-    const daysToCheck = 10; // Miramos los próximos 10 días
+    const daysToCheck = 10;
     let availableSlots = [];
 
-    // 1. Obtener rango de fechas
+    // 1. Obtener rango
     const startRange = new Date(today);
     startRange.setHours(0,0,0,0);
     const endRange = addDays(startRange, daysToCheck);
     
-    // 2. Cargar TODAS las citas existentes en ese rango
+    // 2. Cargar citas
     const snapshot = await db.collection("appointments")
       .where("date", ">=", startRange)
       .where("date", "<=", endRange)
@@ -138,7 +133,6 @@ app.post("/availability-smart", async (req, res) => {
 
     const existingApps = snapshot.docs.map(doc => {
       const data = doc.data();
-      // Calculamos el fin de la cita existente basándonos en SU duración
       const appDuration = data.duration || 60;
       return {
         start: data.date.toDate(),
@@ -148,16 +142,12 @@ app.post("/availability-smart", async (req, res) => {
       };
     });
 
-    // 3. Procesar día a día
+    // 3. Procesar días
     for (let i = 0; i < daysToCheck; i++) {
       const currentDay = addDays(today, i);
-      
-      // Excluir fines de semana (Sáb y Dom)
       const dayNum = currentDay.getDay();
-      if (dayNum === 0 || dayNum === 6) continue; 
+      if (dayNum === 0 || dayNum === 6) continue; // No findes
 
-      // === REGLA 1: CLUSTERING (Agrupación por Localidad) ===
-      // Filtramos citas que ya existen en ESTE día
       const dayApps = existingApps.filter(app => 
         app.start.getDate() === currentDay.getDate() &&
         app.start.getMonth() === currentDay.getMonth()
@@ -165,14 +155,12 @@ app.post("/availability-smart", async (req, res) => {
 
       let dayIsBlockedByDistance = false;
 
-      // Si hoy ya hay trabajo, verificamos que NO esté lejos (> 5km)
-      if (dayApps.length > 0) {
+      // === REGLA 1: CLUSTERING (SOLO SI HAY COORDENADAS) ===
+      if (hasCoords && dayApps.length > 0) {
         for (const bookedApp of dayApps) {
           if (bookedApp.lat && bookedApp.lng) {
             const dist = getDistanceInKm(lat, lng, bookedApp.lat, bookedApp.lng);
             if (dist > MAX_DISTANCE_KM) {
-              // Si hay AL MENOS UNA cita lejos, este día queda descartado.
-              // Esto fuerza a buscar un día vacío o un día con citas cerca.
               dayIsBlockedByDistance = true;
               break; 
             }
@@ -180,34 +168,27 @@ app.post("/availability-smart", async (req, res) => {
         }
       }
 
-      if (dayIsBlockedByDistance) continue; // Día descartado, siguiente.
+      // Si se bloqueó por distancia, saltamos. Si no tenía coords, esto nunca es true.
+      if (dayIsBlockedByDistance) continue; 
 
-      // === REGLA 2: FRANJAS HORARIAS & DURACIÓN ===
+      // === REGLA 2: FRANJAS & DURACIÓN ===
       const blocks = [SCHEDULE.morning, SCHEDULE.afternoon];
 
       for (const block of blocks) {
-        // Bucle hora a hora: 9, 10, 11...
         for (let hour = block.startHour; hour < block.endHour; hour++) {
           
-          // Definimos el inicio de la franja (ej: 09:00)
           const slotStart = new Date(currentDay);
           slotStart.setHours(hour, 0, 0, 0);
           
-          // Definimos el FINAL de la franja VISUAL (ej: 10:00) para mostrar al cliente
           const windowEnd = new Date(currentDay);
-          windowEnd.setHours(hour + 1, 0, 0, 0);
+          windowEnd.setHours(hour + 1, 0, 0, 0); // Visual: 9-10
 
-          // Definimos el FINAL REAL DE TRABAJO para comprobar hueco (Inicio + Duración Servicio)
-          // Esto es clave: si el servicio dura 2h, comprobamos si hay hueco de 9 a 11.
-          const workEnd = new Date(slotStart.getTime() + durationMinutes * 60000);
+          const workEnd = new Date(slotStart.getTime() + durationMinutes * 60000); // Real: 9-10:30
 
-          // Validación básica: no ofrecer horas pasadas
           if (slotStart < new Date()) continue;
 
-          // Validación de colisión estricta
           let isOccupied = false;
           for (const booked of dayApps) {
-            // Comprobamos si el TRABAJO propuesto choca con citas existentes
             if (isOverlapping(slotStart, workEnd, booked.start, booked.end)) {
               isOccupied = true;
               break;
@@ -218,16 +199,12 @@ app.post("/availability-smart", async (req, res) => {
             const startStr = slotStart.toLocaleTimeString("es-ES", { hour: '2-digit', minute: '2-digit' });
             const endStr = windowEnd.toLocaleTimeString("es-ES", { hour: '2-digit', minute: '2-digit' });
             
-            // Textos amigables
-            const label = `${startStr} - ${endStr}`;
-            const message = `La visita se realizará entre las ${startStr} y las ${endStr}`;
-
             availableSlots.push({
               date: slotStart.toISOString().split('T')[0],
               startTime: startStr,
               endTime: endStr,
-              label: label,
-              message: message,
+              label: `${startStr} - ${endStr}`,
+              message: `La visita se realizará entre las ${startStr} y las ${endStr}`,
               isoStart: slotStart.toISOString() 
             });
           }
@@ -235,7 +212,6 @@ app.post("/availability-smart", async (req, res) => {
       }
     }
 
-    // Agrupar respuesta
     const grouped = availableSlots.reduce((acc, slot) => {
       if (!acc[slot.date]) acc[slot.date] = [];
       acc[slot.date].push(slot);
@@ -251,20 +227,20 @@ app.post("/availability-smart", async (req, res) => {
 
   } catch (error) {
     console.error("Error availability:", error);
-    res.status(500).json({ error: error.message });
+    // En caso de error fatal, devolvemos array vacío para no romper el front
+    res.json({ days: [] }); 
   }
 });
 
-// Guardado de Cita (Actualizado para guardar Duración y Ubicación)
 app.post("/appointment-request", async (req, res) => {
     try {
         const { slot, clientData, location, durationMinutes = 60 } = req.body; 
         
         await db.collection("appointments").add({
             date: admin.firestore.Timestamp.fromDate(new Date(slot.isoStart)),
-            duration: durationMinutes, // Guardamos la duración real para futuros cálculos
+            duration: durationMinutes, 
             client: clientData,
-            location: location, // { lat, lng } ESENCIAL para el clustering
+            location: location || null, // Guardamos null si no viene
             createdAt: admin.firestore.FieldValue.serverTimestamp()
         });
         res.json({ success: true });
@@ -278,4 +254,4 @@ app.post("/client-from-token", async(req,res)=>{
   if(d.exists) res.json(d.data()); else res.status(404).json({});
 });
 
-app.listen(PORT, () => console.log(`✅ Marsalva Server V13 (Strict Duration) Running`));
+app.listen(PORT, () => console.log(`✅ Marsalva Server V14 (Flexible) Running`));
