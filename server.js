@@ -1,4 +1,4 @@
-// server.js (V15 - FILTROS VISUALES Y NOMBRES DE DÍAS)
+// server.js (V16 - DEBUG MODE & SAFETY CHECKS)
 const express = require("express");
 const cors = require("cors");
 const admin = require("firebase-admin");
@@ -50,24 +50,39 @@ const verifyFirebaseUser = async (req, res, next) => {
 // =============== 3. UTILS ===============
 const MAX_DISTANCE_KM = 5; 
 
-// Horarios definidos
 const SCHEDULE = {
-  morning: { startHour: 9, endHour: 14, name: "morning" },
-  afternoon: { startHour: 16, endHour: 20, name: "afternoon" },
+  morning: { startHour: 9, endHour: 14 },
+  afternoon: { startHour: 16, endHour: 20 },
 };
 
-function toSpainDate(d=new Date()){return new Date(new Date(d).toLocaleString("en-US",{timeZone:"Europe/Madrid"}));}
-function getSpainNow(){return toSpainDate(new Date());}
-function addDays(d,days){return new Date(d.getTime() + days * 86400000);}
+// Función de fecha más segura para evitar bloqueos
+function toSpainDate(d = new Date()) {
+  try {
+    return new Date(new Date(d).toLocaleString("en-US", { timeZone: "Europe/Madrid" }));
+  } catch (e) {
+    return new Date(); // Fallback a fecha servidor si falla la conversión
+  }
+}
+function getSpainNow() { return toSpainDate(new Date()); }
+function addDays(d, days) { return new Date(d.getTime() + days * 86400000); }
 
-// Formateador de días para que salga "Lunes 23" en la web
+// Función segura para obtener nombre del día
 function getDayLabel(dateObj) {
-  const days = ['Domingo', 'Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado'];
-  const months = ['Enero', 'Febrero', 'Marzo', 'Abril', 'Mayo', 'Junio', 'Julio', 'Agosto', 'Septiembre', 'Octubre', 'Noviembre', 'Diciembre'];
-  return `${days[dateObj.getDay()]} ${dateObj.getDate()} de ${months[dateObj.getMonth()]}`;
+  try {
+    const days = ['Domingo', 'Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado'];
+    const months = ['Enero', 'Febrero', 'Marzo', 'Abril', 'Mayo', 'Junio', 'Julio', 'Agosto', 'Septiembre', 'Octubre', 'Noviembre', 'Diciembre'];
+    const dayName = days[dateObj.getDay()];
+    const dayNum = dateObj.getDate();
+    const monthName = months[dateObj.getMonth()];
+    if (!dayName || !monthName) return "Fecha desconocida";
+    return `${dayName} ${dayNum} de ${monthName}`;
+  } catch (e) {
+    return "Fecha inválida";
+  }
 }
 
 function getDistanceInKm(lat1, lon1, lat2, lon2) {
+  if(!lat1 || !lon1 || !lat2 || !lon2) return 0; // Evitar errores matemáticos
   const R = 6371; 
   const dLat = (lat2 - lat1) * (Math.PI/180);
   const dLon = (lon2 - lon1) * (Math.PI/180);
@@ -82,65 +97,58 @@ function isOverlapping(startA, endA, startB, endB) {
   return startA < endB && startB < endA;
 }
 
-// =============== 4. ADMIN ENDPOINTS (IGUALES) ===============
-// (Copio los básicos para mantener funcionalidad, sin cambios aquí)
+// =============== 4. ADMIN ENDPOINTS (IGUAL) ===============
 app.get("/admin/config/homeserve", verifyFirebaseUser, async (req, res) => {
   try {
     const doc = await db.collection("settings").doc("homeserve").get();
     if (!doc.exists) return res.json({ user: "", hasPass: false, lastChange: null });
     const data = doc.data();
-    res.json({
-      user: data.user,
-      hasPass: !!data.pass,
-      lastChange: data.lastChange ? data.lastChange.toDate().toISOString() : null
-    });
+    res.json({ user: data.user, hasPass: !!data.pass, lastChange: data.lastChange ? data.lastChange.toDate().toISOString() : null });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.post("/admin/config/homeserve", verifyFirebaseUser, async (req, res) => {
   try {
     const { user, pass } = req.body;
-    await db.collection("settings").doc("homeserve").set({
-      user,
-      pass,
-      lastChange: admin.firestore.FieldValue.serverTimestamp()
-    }, { merge: true });
+    await db.collection("settings").doc("homeserve").set({ user, pass, lastChange: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get("/admin/services/homeserve", verifyFirebaseUser, async (req, res) => {
     const snap = await db.collection("externalServices").where("provider", "==", "homeserve").get();
-    const services = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-    res.json(services);
+    res.json(snap.docs.map(d => ({ id: d.id, ...d.data() })));
 });
 
-// =============== 5. LÓGICA DE CITAS (CORREGIDA V15) ===============
+// =============== 5. LÓGICA DE CITAS (V16 - CON LOGS) ===============
 
 app.post("/availability-smart", async (req, res) => {
+  console.log("🔍 [1] Iniciando availability-smart..."); // LOG 1
   try {
-    // AHORA LEEMOS 'timePreference' (mañana/tarde)
-    // Puede venir como timePreference o timeSlot, probamos ambos
     const { lat, lng, durationMinutes = 60, timePreference, timeSlot } = req.body;
     
-    // Detectar qué pidió el usuario (morning / afternoon / null)
-    const requestedTime = (timePreference || timeSlot || "").toLowerCase();
+    // Protección: Convertir a String seguro antes de toLowerCase
+    const rawPref = timePreference || timeSlot || "";
+    const requestedTime = String(rawPref).toLowerCase();
+    
+    console.log(`🔍 [2] Preferencia: ${requestedTime} | Coords: ${lat},${lng}`); // LOG 2
 
-    const hasCoords = (lat && lng && !isNaN(lat) && !isNaN(lng));
+    const hasCoords = (lat && lng && !isNaN(Number(lat)) && !isNaN(Number(lng)));
     const today = getSpainNow();
     const daysToCheck = 10;
     let availableSlots = [];
 
-    // 1. Rango de búsqueda
+    // 1. DB Range
     const startRange = new Date(today);
     startRange.setHours(0,0,0,0);
     const endRange = addDays(startRange, daysToCheck);
     
-    // 2. Cargar citas existentes
+    console.log("🔍 [3] Consultando Firebase..."); // LOG 3
     const snapshot = await db.collection("appointments")
       .where("date", ">=", startRange)
       .where("date", "<=", endRange)
       .get();
+    console.log(`🔍 [4] Firebase respondió. Citas encontradas: ${snapshot.size}`); // LOG 4
 
     const existingApps = snapshot.docs.map(doc => {
       const data = doc.data();
@@ -153,11 +161,12 @@ app.post("/availability-smart", async (req, res) => {
       };
     });
 
-    // 3. Procesar días
+    // 2. Loop
+    console.log("🔍 [5] Iniciando bucle de días..."); // LOG 5
     for (let i = 0; i < daysToCheck; i++) {
       const currentDay = addDays(today, i);
       const dayNum = currentDay.getDay();
-      if (dayNum === 0 || dayNum === 6) continue; // Saltar findes
+      if (dayNum === 0 || dayNum === 6) continue; 
 
       const dayApps = existingApps.filter(app => 
         app.start.getDate() === currentDay.getDate() &&
@@ -165,8 +174,6 @@ app.post("/availability-smart", async (req, res) => {
       );
 
       let dayIsBlockedByDistance = false;
-
-      // REGLA 1: CLUSTERING (5KM)
       if (hasCoords && dayApps.length > 0) {
         for (const bookedApp of dayApps) {
           if (bookedApp.lat && bookedApp.lng) {
@@ -180,11 +187,7 @@ app.post("/availability-smart", async (req, res) => {
       }
       if (dayIsBlockedByDistance) continue; 
 
-      // === FILTRO DE MAÑANA / TARDE ===
-      // Si el usuario pidió "morning", solo usamos SCHEDULE.morning.
-      // Si pidió "afternoon", solo usamos SCHEDULE.afternoon.
-      // Si no pidió nada, usamos ambos.
-      
+      // Selección de bloques
       let blocksToUse = [];
       if (requestedTime.includes('mañana') || requestedTime.includes('morning')) {
          blocksToUse.push(SCHEDULE.morning);
@@ -196,16 +199,14 @@ app.post("/availability-smart", async (req, res) => {
 
       for (const block of blocksToUse) {
         for (let hour = block.startHour; hour < block.endHour; hour++) {
-          
           const slotStart = new Date(currentDay);
           slotStart.setHours(hour, 0, 0, 0);
           
           const windowEnd = new Date(currentDay);
-          windowEnd.setHours(hour + 1, 0, 0, 0); // Visual: 09:00 - 10:00
+          windowEnd.setHours(hour + 1, 0, 0, 0); 
+          const workEnd = new Date(slotStart.getTime() + durationMinutes * 60000); 
 
-          const workEnd = new Date(slotStart.getTime() + durationMinutes * 60000); // Real: 09:00 - 10:xx
-
-          if (slotStart < new Date()) continue; // No horas pasadas
+          if (slotStart < new Date()) continue;
 
           let isOccupied = false;
           for (const booked of dayApps) {
@@ -219,14 +220,11 @@ app.post("/availability-smart", async (req, res) => {
             const startStr = slotStart.toLocaleTimeString("es-ES", { hour: '2-digit', minute: '2-digit' });
             const endStr = windowEnd.toLocaleTimeString("es-ES", { hour: '2-digit', minute: '2-digit' });
             
-            // Texto EXACTO que pediste
-            const label = `${startStr} - ${endStr}`; 
-            
             availableSlots.push({
               date: slotStart.toISOString().split('T')[0],
               startTime: startStr,
               endTime: endStr,
-              label: label, // Esto debería salir en el botón
+              label: `${startStr} - ${endStr}`,
               message: `La visita se realizará entre las ${startStr} y las ${endStr}`,
               isoStart: slotStart.toISOString() 
             });
@@ -235,7 +233,8 @@ app.post("/availability-smart", async (req, res) => {
       }
     }
 
-    // AGRUPAR POR DÍA CON FORMATO BONITO
+    console.log(`🔍 [6] Bucle terminado. Slots generados: ${availableSlots.length}`); // LOG 6
+
     const grouped = availableSlots.reduce((acc, slot) => {
       if (!acc[slot.date]) acc[slot.date] = [];
       acc[slot.date].push(slot);
@@ -243,26 +242,26 @@ app.post("/availability-smart", async (req, res) => {
     }, {});
 
     const responseArray = Object.keys(grouped).map(dateKey => {
-      // Truco: Creamos el objeto fecha para sacar el nombre del día
       const dateObj = new Date(dateKey); 
-      const labelDia = getDayLabel(dateObj); // "Lunes 23 de Octubre"
-
+      const labelDia = getDayLabel(dateObj); 
       return {
-        date: dateKey,       // Para lógica
-        dayLabel: labelDia,  // Para mostrar en la web (soluciona el punto azul vacío)
-        title: labelDia,     // Redundancia por si tu front usa 'title'
+        date: dateKey,       
+        dayLabel: labelDia,  
+        title: labelDia,     
         slots: grouped[dateKey]
       };
     });
 
+    console.log("🔍 [7] Enviando respuesta..."); // LOG 7
     res.json({ days: responseArray });
 
   } catch (error) {
-    console.error("Error availability:", error);
-    res.json({ days: [] }); 
+    console.error("❌ ERROR CRÍTICO en availability-smart:", error);
+    res.json({ days: [] }); // Devolver array vacío para no colgar el front
   }
 });
 
+// ... resto de endpoints (guardado, etc) igual ...
 app.post("/appointment-request", async (req, res) => {
     try {
         const { slot, clientData, location, durationMinutes = 60 } = req.body; 
@@ -274,9 +273,7 @@ app.post("/appointment-request", async (req, res) => {
             createdAt: admin.firestore.FieldValue.serverTimestamp()
         });
         res.json({ success: true });
-    } catch(e) {
-        res.status(500).json({ error: e.message });
-    }
+    } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 app.post("/client-from-token", async(req,res)=>{
@@ -284,4 +281,4 @@ app.post("/client-from-token", async(req,res)=>{
   if(d.exists) res.json(d.data()); else res.status(404).json({});
 });
 
-app.listen(PORT, () => console.log(`✅ Marsalva Server V15 (Fixed UI) Running`));
+app.listen(PORT, () => console.log(`✅ Marsalva Server V16 (DEBUG MODE) Running`));
