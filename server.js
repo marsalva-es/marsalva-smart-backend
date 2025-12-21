@@ -1,9 +1,9 @@
-// server.js (V17 - BASE V11 + SMART SLOTS ONLY)
+// server.js (V18 - VISUAL VERSION TAG)
 const express = require("express");
 const cors = require("cors");
 const admin = require("firebase-admin");
 
-// =============== 1. INICIALIZACIÓN (INTACTO) ===============
+// =============== 1. INICIALIZACIÓN ===============
 if (!admin.apps.length) {
   const projectId = process.env.FIREBASE_PROJECT_ID;
   const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
@@ -30,41 +30,36 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 10000;
 
-// =============== 2. SEGURIDAD REAL (MIDDLEWARE) (INTACTO) ===============
+// =============== 2. SEGURIDAD ===============
 const verifyFirebaseUser = async (req, res, next) => {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
     return res.status(401).json({ error: "No autorizado. Falta token." });
   }
-
   const idToken = authHeader.split('Bearer ')[1];
-
   try {
     const decodedToken = await admin.auth().verifyIdToken(idToken);
-    req.user = decodedToken; 
-    next(); 
+    req.user = decodedToken;
+    next();
   } catch (error) {
     console.error("Error verificando token:", error);
     return res.status(403).json({ error: "Token inválido o caducado." });
   }
 };
 
-// =============== 3. CONFIGURACIÓN GLOBALES (INTACTO + NUEVOS UTILS) ===============
+// =============== 3. UTILS ===============
 const HOME_ALGECIRAS = { lat: 36.1408, lng: -5.4562 };
-const MAX_DISTANCE_KM = 5; // <--- NUEVA REGLA
+const MAX_DISTANCE_KM = 5; 
 
-// AJUSTE: Simplificado a horas enteras para tus franjas de 1h
 const SCHEDULE = {
   morning: { startHour: 9, endHour: 14 },   
   afternoon: { startHour: 16, endHour: 20 }, 
 };
 
-// --- Funciones de utilidad ---
 function toSpainDate(d=new Date()){return new Date(new Date(d).toLocaleString("en-US",{timeZone:"Europe/Madrid"}));}
 function getSpainNow(){return toSpainDate(new Date());}
 function addDays(d,days){return new Date(d.getTime() + days * 86400000);}
 
-// NUEVO: Calcular distancia KM (Fórmula Haversine)
 function getDistanceInKm(lat1, lon1, lat2, lon2) {
   if(!lat1 || !lon1 || !lat2 || !lon2) return 0;
   const R = 6371; 
@@ -77,43 +72,30 @@ function getDistanceInKm(lat1, lon1, lat2, lon2) {
   return R * c;
 }
 
-// NUEVO: Verificar choque de horarios
 function isOverlapping(startA, endA, startB, endB) {
   return startA < endB && startB < endA;
 }
 
-// NUEVO: Nombre bonito del día (ej: "Lunes 23 de Octubre")
 function getDayLabel(dateObj) {
   const days = ['Domingo', 'Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado'];
   const months = ['Enero', 'Febrero', 'Marzo', 'Abril', 'Mayo', 'Junio', 'Julio', 'Agosto', 'Septiembre', 'Octubre', 'Noviembre', 'Diciembre'];
   return `${days[dateObj.getDay()]} ${dateObj.getDate()} de ${months[dateObj.getMonth()]}`;
 }
 
-
-// =============== 4. ENDPOINTS PROTEGIDOS (INTACTO) ===============
-// (Copio exactamente tus endpoints de admin V11)
-
+// =============== 4. ADMIN ENDPOINTS ===============
 app.get("/admin/config/homeserve", verifyFirebaseUser, async (req, res) => {
   try {
     const doc = await db.collection("settings").doc("homeserve").get();
     if (!doc.exists) return res.json({ user: "", hasPass: false, lastChange: null });
     const data = doc.data();
-    res.json({
-      user: data.user,
-      hasPass: !!data.pass,
-      lastChange: data.lastChange ? data.lastChange.toDate().toISOString() : null
-    });
+    res.json({ user: data.user, hasPass: !!data.pass, lastChange: data.lastChange ? data.lastChange.toDate().toISOString() : null });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.post("/admin/config/homeserve", verifyFirebaseUser, async (req, res) => {
   try {
     const { user, pass } = req.body;
-    await db.collection("settings").doc("homeserve").set({
-      user,
-      pass,
-      lastChange: admin.firestore.FieldValue.serverTimestamp()
-    }, { merge: true });
+    await db.collection("settings").doc("homeserve").set({ user, pass, lastChange: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -131,8 +113,7 @@ app.post("/admin/config/render", verifyFirebaseUser, async (req, res) => {
 
 app.get("/admin/services/homeserve", verifyFirebaseUser, async (req, res) => {
     const snap = await db.collection("externalServices").where("provider", "==", "homeserve").get();
-    const services = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-    res.json(services);
+    res.json(snap.docs.map(d => ({ id: d.id, ...d.data() })));
 });
 
 app.put("/admin/services/homeserve/:id", verifyFirebaseUser, async (req, res) => {
@@ -150,22 +131,27 @@ app.post("/admin/services/homeserve/delete", verifyFirebaseUser, async (req, res
 });
 
 
-// =============== 5. ENDPOINTS PÚBLICOS (MODIFICADO SOLO ESTO) ===============
+// =============== 5. ENDPOINTS PÚBLICOS ===============
 
-// AQUÍ VA LA LÓGICA NUEVA DE FRANJAS DE 1 HORA Y DISTANCIA
+// === NUEVO ENDPOINT PARA VER LA VERSIÓN ===
+app.get("/version", (req, res) => {
+    res.json({ 
+        version: "V18 - Smart (Hora exacta + 5km)", 
+        status: "online" 
+    });
+});
+// ==========================================
+
 app.post("/availability-smart", async (req, res) => {
   try {
     const { lat, lng, durationMinutes = 60, timePreference, timeSlot } = req.body;
     const requestedTime = (timePreference || timeSlot || "").toLowerCase();
-
-    // Verificamos si tenemos coordenadas válidas (si no, no aplicamos filtro distancia)
     const hasCoords = (lat && lng && !isNaN(lat) && !isNaN(lng));
 
     const today = getSpainNow();
     const daysToCheck = 10;
     let availableSlots = [];
 
-    // 1. Traer rango de citas
     const startRange = new Date(today);
     startRange.setHours(0,0,0,0);
     const endRange = addDays(startRange, daysToCheck);
@@ -185,19 +171,17 @@ app.post("/availability-smart", async (req, res) => {
       };
     });
 
-    // 2. Procesar Días
     for (let i = 0; i < daysToCheck; i++) {
       const currentDay = addDays(today, i);
       const dayNum = currentDay.getDay();
-      if (dayNum === 0 || dayNum === 6) continue; // Saltar fin de semana
+      if (dayNum === 0 || dayNum === 6) continue; 
 
-      // Citas que ya existen ese día
       const dayApps = existingApps.filter(app => 
         app.start.getDate() === currentDay.getDate() &&
         app.start.getMonth() === currentDay.getMonth()
       );
 
-      // --- REGLA DISTANCIA (5KM) ---
+      // Filtro Distancia
       let dayIsBlockedByDistance = false;
       if (hasCoords && dayApps.length > 0) {
         for (const bookedApp of dayApps) {
@@ -210,9 +194,9 @@ app.post("/availability-smart", async (req, res) => {
           }
         }
       }
-      if (dayIsBlockedByDistance) continue; // Si está lejos, saltamos el día entero
+      if (dayIsBlockedByDistance) continue;
 
-      // --- FILTRO MAÑANA / TARDE ---
+      // Filtro Mañana/Tarde
       let blocksToUse = [];
       if (requestedTime.includes('mañana') || requestedTime.includes('morning')) {
          blocksToUse.push(SCHEDULE.morning);
@@ -222,21 +206,17 @@ app.post("/availability-smart", async (req, res) => {
          blocksToUse = [SCHEDULE.morning, SCHEDULE.afternoon];
       }
 
-      // --- GENERAR SLOTS DE 1 HORA ---
       for (const block of blocksToUse) {
         for (let hour = block.startHour; hour < block.endHour; hour++) {
-          
           const slotStart = new Date(currentDay);
           slotStart.setHours(hour, 0, 0, 0);
           
           const windowEnd = new Date(currentDay);
-          windowEnd.setHours(hour + 1, 0, 0, 0); // Visual: 09:00 - 10:00
+          windowEnd.setHours(hour + 1, 0, 0, 0); 
+          const workEnd = new Date(slotStart.getTime() + durationMinutes * 60000); 
 
-          const workEnd = new Date(slotStart.getTime() + durationMinutes * 60000); // Real: Duración trabajo
+          if (slotStart < new Date()) continue;
 
-          if (slotStart < new Date()) continue; // No mostrar horas pasadas
-
-          // Verificar colisión
           let isOccupied = false;
           for (const booked of dayApps) {
             if (isOverlapping(slotStart, workEnd, booked.start, booked.end)) {
@@ -262,7 +242,6 @@ app.post("/availability-smart", async (req, res) => {
       }
     }
 
-    // 3. Formatear Respuesta con Nombres de Días
     const grouped = availableSlots.reduce((acc, slot) => {
       if (!acc[slot.date]) acc[slot.date] = [];
       acc[slot.date].push(slot);
@@ -271,10 +250,10 @@ app.post("/availability-smart", async (req, res) => {
 
     const responseArray = Object.keys(grouped).map(dateKey => {
       const dateObj = new Date(dateKey); 
-      const labelDia = getDayLabel(dateObj); // "Lunes 23 de Octubre"
+      const labelDia = getDayLabel(dateObj); 
       return {
         date: dateKey,
-        dayLabel: labelDia, // Esto llena el título del día en la web
+        dayLabel: labelDia,
         title: labelDia,
         slots: grouped[dateKey]
       };
@@ -284,32 +263,27 @@ app.post("/availability-smart", async (req, res) => {
 
   } catch (error) {
     console.error("Error availability:", error);
-    res.json({ days: [] }); // En caso de error, devuelve vacío, no cuelga
+    res.json({ days: [] });
   }
 });
 
-// Guardado de Cita (Actualizado para guardar lat/lng)
 app.post("/appointment-request", async (req, res) => {
     try {
         const { slot, clientData, location, durationMinutes = 60 } = req.body; 
-        
         await db.collection("appointments").add({
             date: admin.firestore.Timestamp.fromDate(new Date(slot.isoStart)),
             duration: durationMinutes,
             client: clientData,
-            location: location || null, // Guardamos location para el futuro
+            location: location || null,
             createdAt: admin.firestore.FieldValue.serverTimestamp()
         });
         res.json({ success: true });
-    } catch(e) {
-        res.status(500).json({ error: e.message });
-    }
+    } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// CLIENT INFO (INTACTO)
 app.post("/client-from-token", async(req,res)=>{
   const d = await db.collection("appointments").doc(req.body.token).get();
   if(d.exists) res.json(d.data()); else res.status(404).json({});
 });
 
-app.listen(PORT, () => console.log(`✅ Marsalva Server V17 (Stable V11 + Smart) Running`));
+app.listen(PORT, () => console.log(`✅ Marsalva Server V18 (With Version Tag) Running`));
